@@ -1,7 +1,7 @@
-"""POC (and every other existing strategy) must behave exactly as on main.
-1. AST: every function/method in bot.py is identical to main's, except the five hook points listed below.
+"""POC (and every other existing strategy) must behave exactly as before BOOK JUMP (commit POC_BASELINE).
+1. AST: every function/method in bot.py is identical to the baseline's, except the five hook points listed below.
 2. Behaviour: with ENABLE_BOOKJUMP=0 the hook points produce identical output (config, /status, summaries,
-   start-up Telegram message) to main's code on the same state."""
+   start-up Telegram message) to the baseline code on the same state."""
 import ast
 import importlib.util
 import os
@@ -15,13 +15,14 @@ HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, HERE)
 HOOKS = {"make_cfg", "Bot.__init__", "Bot.status_text", "Bot.report", "Bot.startup"}
 ADDED = {"Bot.bookjump_setup"}
+POC_BASELINE = "7b88317"           # last commit before BOOK JUMP (bot.py as deployed 2026-11-22 08:32 UTC)
 ENV = {"EXCHANGE": "binance", "DRY_RUN": "1", "ENABLE_POC": "1", "ENABLE_SHORT": "0", "ENABLE_LONG": "0",
        "ENABLE_BREAKOUT": "0", "POC_SKIP_US_SESSION": "1", "START_CAPITAL_INR": "11890", "USD_INR_RATE": "85"}
 
 
 def main_source():
     try:
-        return subprocess.run(["git", "-C", HERE, "show", "main:bot.py"], capture_output=True, text=True,
+        return subprocess.run(["git", "-C", HERE, "show", f"{POC_BASELINE}:bot.py"], capture_output=True, text=True,
                               check=True).stdout
     except (OSError, subprocess.CalledProcessError):
         return None
@@ -42,7 +43,7 @@ def functions(src):
 OLD_SRC = main_source()
 
 
-@unittest.skipIf(OLD_SRC is None, "git / main branch not available")
+@unittest.skipIf(OLD_SRC is None, "git / baseline commit not available")
 class PocUnchanged(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

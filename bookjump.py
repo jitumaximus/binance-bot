@@ -683,6 +683,12 @@ class BookJump:
         st["days"] = {k: v for k, v in st["days"].items() if k >= cut}
         return st
 
+    def ensure_walls_file(self):
+        """walls.csv exists (header only) from start-up, so the log sync picks it up before the first wall row."""
+        if not os.path.exists(self.walls_file):
+            with open(self.walls_file, "w", newline="") as fh:
+                csv.writer(fh).writerow(WALL_COLS)
+
     def ensure_trades_header(self):
         """trades.csv gets a trailing 'session' column (POC rows leave it empty). Run before any thread starts."""
         head = ["open_time_ist", "close_time_ist", "mode", "symbol", "side", "contracts", "entry", "stop_loss",
@@ -749,6 +755,7 @@ class BookJump:
         if importlib.util.find_spec("websocket") is None:
             raise RuntimeError("websocket-client is not installed (pip install -r requirements.txt)")
         self.ensure_trades_header()
+        self.ensure_walls_file()
         syms = self.refresh_universe()
         with self.lock:
             self.save()

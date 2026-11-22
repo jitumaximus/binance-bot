@@ -535,6 +535,27 @@ class Misc(unittest.TestCase):
         self.assertEqual(subs, {"OTHERUSDT", SYM})
 
 
+class Files(unittest.TestCase):
+    def runner(self, d):
+        r = bj.BookJump.__new__(bj.BookJump)               # file helpers only, no threads / network
+        r.walls_file = os.path.join(d, "walls.csv")
+        return r
+
+    def test_walls_file_created_with_header_once(self):
+        import csv
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            r = self.runner(d)
+            r.ensure_walls_file()
+            with open(r.walls_file) as fh:
+                self.assertEqual(list(csv.reader(fh)), [bj.WALL_COLS])
+            r.wall_row(["x"] * len(bj.WALL_COLS))             # first real row: no second header
+            r.ensure_walls_file()                              # restart: existing rows kept
+            with open(r.walls_file) as fh:
+                rows = list(csv.reader(fh))
+            self.assertEqual((rows[0], len(rows)), (bj.WALL_COLS, 2))
+
+
 class RecordedStream(unittest.TestCase):
     def test_replay(self):
         """A recorded-format Binance stream: wall -> order -> queue fill -> breakeven -> trail -> exit."""
