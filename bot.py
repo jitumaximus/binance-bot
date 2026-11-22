@@ -100,6 +100,8 @@ from zoneinfo import ZoneInfo
 
 import requests
 
+import bookjump
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IST = ZoneInfo("Asia/Kolkata")
 NY = ZoneInfo("America/New_York")
@@ -207,6 +209,8 @@ def make_cfg():
         # short mirror of the 1H breakout (own book); defaults to the breakout switch, so bot 2 (breakout off) stays POC-only
         "enable_breakdown": b("ENABLE_BREAKDOWN", os.getenv("ENABLE_BREAKOUT", "1")),
         "enable_poc": b("ENABLE_POC", "0"),
+        # BOOK JUMP order-book penny-jumping (bookjump.py): paper mode on Binance only, its own book and threads
+        "enable_bookjump": b("ENABLE_BOOKJUMP", "0"),
         "poc_away_pct": f("POC_AWAY_PCT", 2.0),            # top coins (POC_MAJORS)
         "poc_away_other_pct": f("POC_AWAY_OTHER_PCT", 5.0),  # every other coin (stock/ETF tokens use 2%)
         "poc_majors": lst("POC_MAJORS") or [x + ("USDT" if exchange == "binance" else "USD") for x in
@@ -999,6 +1003,7 @@ class Bot:
         self.last_equity, self.last_equity_ts = 0.0, 0
         self.last_protect_check = 0
         self.last_ob_warn = 0
+        self.bj = None                       # BOOK JUMP runner (bookjump.py) when ENABLE_BOOKJUMP=1
         self.migrate_trades_header()
 
     def migrate_trades_header(self):
@@ -2491,6 +2496,8 @@ class Bot:
         lines.append(f"Breakout ranges armed this hour: {len(bo)}")
         top = sorted(bo.items(), key=lambda kv: kv[1]["band_pct"])[:5]
         lines += [f"  {s} range high {v['range_high']} ({v['band_pct']}%)" for s, v in top]
+        if self.bj:
+            lines += ["", self.bj.status_text()]
         return "\n".join(x for x in lines if x is not None)
 
     def report(self, day=None):
@@ -2510,6 +2517,8 @@ class Bot:
             lines.append(f"{n}: {extra} | P&L ${pnl:+.2f} ({pnl / base * 100 if base else 0:+.1f}%) "
                          f"| balance ${b['balance']:.2f}")
         lines.append(f"ALL {len(self.book_names())}: P&L ${tot_pnl:+.2f} (Rs {self.inr(tot_pnl):+,.0f}) | balance ${tot_bal:.2f}")
+        if self.bj:
+            lines.append(self.bj.report_line(day))
         return "\n".join(lines)
 
     def close_now(self, t, reason):
@@ -2593,6 +2602,26 @@ class Bot:
                 self.tg.send("Commands: /status /summary /pause /resume /killswitch")
         self.save_state()
 
+    # ---- BOOK JUMP (bookjump.py) ----
+    def bookjump_setup(self):
+        """ENABLE_BOOKJUMP=1: create the BOOK JUMP runner (paper mode on Binance only). Returns the start-up line."""
+        c = self.cfg
+        if not c["enable_bookjump"]:
+            return ""
+        why = bookjump.refuse_reason(c)
+        if why:
+            self.event("BJ_REFUSED", reason=why)
+            return f"\nBOOK JUMP: NOT started - it only runs in paper mode on Binance ({why})."
+        try:
+            self.bj = bookjump.BookJump(c, self.tg, self.event, self.in_us_session,
+                                        Binance("https://fapi.binance.com", "", "", c["ua"]), c["data_dir"],
+                                        lambda: bool(self.state.get("paused")))
+            return "\n" + self.bj.prepare()
+        except Exception as ex:  # noqa: BLE001
+            self.bj = None
+            log.exception("BOOK JUMP setup failed")
+            return f"\nBOOK JUMP: NOT started - {str(ex)[:200]}"
+
     # ---- main loop ----
     def startup(self):
         c = self.cfg
@@ -2616,9 +2645,10 @@ class Bot:
                         self.tg.send(f"WARNING: unmanaged open position found on {p.get('product_symbol', p.get('product_id'))}. The bot will not touch it.")
             except Exception as ex:  # noqa: BLE001
                 log.warning("position reconciliation skipped: %s", ex)
+        bj_line = self.bookjump_setup()
         self.tg.send(
             f"Bot started [{c['mode']}]\n{len(prods)} instruments, account ${eq:.2f} (Rs {self.inr(eq):.0f})\n"
-            + "\n".join(f"  {n}: ${self.book(n)['balance']:.2f}" for n in self.book_names()) + "\n"
+            + "\n".join(f"  {n}: ${self.book(n)['balance']:.2f}" for n in self.book_names()) + bj_line + "\n"
             + self.strategy_desc() + "\nOne position at a time per strategy; a coin is held by one strategy at most"
             + (f" | stop to entry at +{c['be_trigger_r']:g}R" if c["be_trigger_r"] > 0 else "")
             + (f" | order book {c['ob_min_ratio']:g}x within {c['ob_depth_pct']:g}%" if c["ob_filter"] else "") + "\n"
@@ -2629,11 +2659,13 @@ class Bot:
             + (f", trades/day {c['max_trades_day']}" if c["max_trades_day"] > 0 else "")
             + (f", trades/month {c['max_trades_month']}" if c["max_trades_month"] > 0 else "")
             + (f", monthly loss {c['monthly_loss_pct']:g}%" if c["monthly_loss_pct"] > 0 else "") + "\n"
-            f"Commands: /status /summary /pause /resume /killswitch"
+            "Commands: /status /summary /pause /resume /killswitch"
         )
         self.event("STARTED", mode=c["mode"], instruments=len(prods), equity_usd=round(eq, 2),
                    short=c["enable_short"], long=c["enable_long"], breakout=c["enable_breakout"],
                    session=c["session"], books={n: self.book(n)["balance"] for n in self.book_names()})
+        if self.bj:
+            self.bj.start()
 
     def tick(self, now):
         if now - getattr(self, "_last_tg", 0) >= 3:

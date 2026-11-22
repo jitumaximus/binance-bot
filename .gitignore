@@ -18,3 +18,7 @@ data/
 # leftovers
 *.bak
 *.save
+walls*.csv
+bookjump_state.json
+*.tmp
+tests/__pycache__/
