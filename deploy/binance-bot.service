@@ -1,0 +1,15 @@
+[Unit]
+Description=Binance breakout bot (paper)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/binance-bot
+ExecStart=/home/ubuntu/binance-bot/venv/bin/python /home/ubuntu/binance-bot/bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

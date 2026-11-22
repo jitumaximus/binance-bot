@@ -5,6 +5,7 @@
 token.json
 # environments / caches
 venv/
+venv.old/
 .venv/
 __pycache__/
 *.pyc
