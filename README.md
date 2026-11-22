@@ -46,13 +46,18 @@ swept into or used to fund other books): POC is not affected
   `BJ_MAX_OPEN` orders + positions, one attempt per wall. Size: `BJ_RISK_PCT` of the book balance /
   (entry - (wall - 1 tick)), notional capped at `BJ_MAX_NOTIONAL_X` x balance, rounded down to the step, skipped
   below min notional. Cancelled when the wall is pulled (lost > half its size) or drops below the wall test, after
-  `BJ_ORDER_TIMEOUT_SEC`, or when price moves more than `BJ_AWAY_TICKS` ticks away.
+  `BJ_ORDER_TIMEOUT_SEC`, or when price moves more than max(`BJ_AWAY_PCT` %, `BJ_AWAY_TICKS` ticks) away.
 - **Paper fill**: queue ahead = size already resting at our price when placed. Filled when a trade prints through
   our price, or when aggressive trades at our price (sells for a buy) exceed that queue. Filled at our price.
-- **Exit** (all at the next trade price after the trigger, as a market order):
-  before breakeven: the wall level disappears or falls below `BJ_WALL_KEEP_PCT` % of its size at the fill, or a
-  trade prints through the wall price; at +`BJ_BE_PCT` % the stop moves to entry, then trails `BJ_TRAIL_PCT` %
-  behind the best price since entry (only tightens); time stop after `BJ_TIME_STOP_SEC` if breakeven not reached.
+- **Exit** (all at the next trade price after the trigger, as a market order; the trade that fills us never
+  triggers an exit):
+  before breakeven: the wall level is missing (`WALL_GONE`) or below `BJ_WALL_KEEP_PCT` % of its size at the fill
+  (`WALL_SHRANK`), judged only from book snapshots taken after the fill (Binance event time, because depth and
+  trades arrive on separate sockets), or a trade prints strictly beyond the wall price (`WALL_BROKEN`);
+  breakeven once the trade is >= `BJ_BE_PCT` % AND >= `BJ_BE_TICKS` ticks in profit: stop to entry, then it trails
+  max(`BJ_TRAIL_PCT` %, `BJ_TRAIL_TICKS` ticks) behind the best price since entry (only tightens); time stop after
+  `BJ_TIME_STOP_SEC` if breakeven not reached. Every `BJ_EXIT` event logs these settings, the distances used, the
+  best price, the final stop, the fill trade's price and what triggered the exit.
 - **Costs**: entry maker `BJ_MAKER_PCT` % + `BJ_GST_PCT` % GST; exit taker `BJ_TAKER_PCT` % + GST.
 - **Kill switch**: `BJ_PAUSE_HOURS` pause after a `BJ_DAY_LOSS_PCT` % loss in one IST day, `BJ_MAX_LOSS_STREAK`
   losses in a row, or a stale feed; resting orders cancelled, open positions closed at the next trade. Telegram on

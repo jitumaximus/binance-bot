@@ -85,10 +85,13 @@ def load_cfg(env=None):
         "risk_pct": f("BJ_RISK_PCT", 1),
         "max_notional_x": f("BJ_MAX_NOTIONAL_X", 3),
         "order_timeout": f("BJ_ORDER_TIMEOUT_SEC", 60),
+        "away_pct": f("BJ_AWAY_PCT", 0.5),
         "away_ticks": f("BJ_AWAY_TICKS", 10),
         "wall_keep_pct": f("BJ_WALL_KEEP_PCT", 50),
         "be_pct": f("BJ_BE_PCT", 0.15),
-        "trail_pct": f("BJ_TRAIL_PCT", 0.15),
+        "be_ticks": f("BJ_BE_TICKS", 5),
+        "trail_pct": f("BJ_TRAIL_PCT", 0.3),
+        "trail_ticks": f("BJ_TRAIL_TICKS", 8),
         "time_stop": f("BJ_TIME_STOP_SEC", 300),
         "maker_pct": f("BJ_MAKER_PCT", 0.02),
         "taker_pct": f("BJ_TAKER_PCT", 0.05),
@@ -172,16 +175,18 @@ def fees_usd(entry, exit_px, qty, c):
 
 
 def parse_msg(raw):
-    """Binance combined-stream message -> ("depth", sym, bids, asks) | ("trade", sym, price, qty, buyer_maker) | None"""
+    """Binance combined-stream message -> ("depth", sym, bids, asks, xt) | ("trade", sym, price, qty, buyer_maker, xt)
+    | None. xt = Binance's own event time in ms (None if absent)."""
     m = json.loads(raw)
     d = m.get("data") if isinstance(m, dict) and "data" in m else m
     if not isinstance(d, dict):
         return None
+    xt = int(d.get("T") or d.get("E") or 0) or None             # exchange time (ms); orders the two sockets
     if d.get("e") == "aggTrade":
-        return ("trade", d["s"], float(d["p"]), float(d["q"]), bool(d["m"]))
+        return ("trade", d["s"], float(d["p"]), float(d["q"]), bool(d["m"]), xt)
     if "b" in d and "a" in d and d.get("s"):
         return ("depth", d["s"], [(float(p), float(q)) for p, q in d["b"]],
-                [(float(p), float(q)) for p, q in d["a"]])
+                [(float(p), float(q)) for p, q in d["a"]], xt)
     return None
 
 
@@ -255,10 +260,10 @@ class Engine:
         return self.universe | set(self.orders) | set(self.pos)
 
     # ---- market data ----
-    def on_depth(self, sym, ts, bids, asks):
+    def on_depth(self, sym, ts, bids, asks, xt=None):
         if not bids or not asks:
             return
-        self.book[sym] = {"ts": ts, "bids": bids, "asks": asks}
+        self.book[sym] = {"ts": ts, "bids": bids, "asks": asks, "xt": xt}
         m = self.meta.get(sym)
         if not m:
             return
@@ -295,10 +300,10 @@ class Engine:
                 self.wlog.append(w)
                 self.sess(ts, w["session"])["walls"] += 1
         self.check_order_book(sym, ts)
-        self.check_pos_book(sym, ts)
+        self.check_pos_book(sym, ts, xt)
         self.try_entry(sym, ts)
 
-    def on_trade(self, sym, ts, px, qty, buyer_maker):
+    def on_trade(self, sym, ts, px, qty, buyer_maker, xt=None):
         for w in self.walls.get(sym, {}).values():
             d = 1 if w["side"] == "bid" else -1
             tick = self.meta[sym]["tick"]
@@ -312,8 +317,8 @@ class Engine:
             return
         o = self.orders.get(sym)
         if o and self.order_filled(o, px, qty, buyer_maker):
-            self.fill(sym, ts)
-            p = self.pos.get(sym)
+            self.fill(sym, ts, px, xt)
+            return                                     # the trade that fills us never triggers an exit
         if p:
             self.pos_trade(p, ts, px)
 
@@ -403,7 +408,8 @@ class Engine:
             return
         tick, b = self.meta[sym]["tick"], self.book[sym]
         away = (b["bids"][0][0] - o["price"]) if o["side"] == "long" else (o["price"] - b["asks"][0][0])
-        if away > self.c["away_ticks"] * tick + tick / 2:
+        limit = max(o["price"] * self.c["away_pct"] / 100.0, self.c["away_ticks"] * tick)
+        if away > limit + tick / 2:
             self.cancel(sym, ts, "price_away")
 
     @staticmethod
@@ -421,7 +427,7 @@ class Engine:
                 o["at_px"] += qty
         return o["at_px"] > o["queue"]
 
-    def fill(self, sym, ts):
+    def fill(self, sym, ts, px=None, xt=None):
         o = self.orders.pop(sym)
         w = o["wall"]
         w["bj_order"] = "filled"
@@ -430,47 +436,68 @@ class Engine:
              "wall_price": o["wall_price"], "wall_ref_usdt": w["usdt"] if w["ended_ts"] is None else o["wall_usdt"],
              "fill_ts": ts, "best": o["price"], "be": False, "stop": o["stop"], "session": tag,
              "exit_pending": "", "tick": self.meta[sym]["tick"], "step": self.meta[sym]["step"],
-             "wall_mult": o["wall_mult"]}
+             "wall_mult": o["wall_mult"], "fill_px": px, "fill_xt": xt, "trigger": {}}
         self.pos[sym] = p
         self.sess(ts, tag)["fills"] += 1
         self.sink.event("BJ_FILL", symbol=sym, side=p["side"], price=p["entry"], qty=p["qty"],
-                        wall_price=p["wall_price"], wall_usdt=round(p["wall_ref_usdt"], 2),
+                        wall_price=p["wall_price"], wall_usdt=round(p["wall_ref_usdt"], 2), fill_trade_px=px,
                         wait_s=round(ts - o["placed_ts"], 1), session=tag)
         self.sink.tg(f"BJ FILL {sym} {p['side'].upper()} {p['qty']:g} @ {p['entry']:g} | wall {p['wall_price']:g} "
                      f"(${p['wall_ref_usdt'] / 1000:,.0f}k, {p['wall_mult']:.1f}x) | {tag}")
         self.sink.save()
 
     # ---- positions ----
-    def check_pos_book(self, sym, ts):
+    def check_pos_book(self, sym, ts, xt=None):
+        """Before breakeven: exit if the wall level is missing (WALL_GONE) or below wall_keep_pct of its size at the
+        fill (WALL_SHRANK). Only book snapshots taken after the fill count: depth and trades arrive on separate
+        sockets, so a snapshot from before the fill can arrive after it (Binance event time decides)."""
         p = self.pos.get(sym)
         if not p or p["be"] or p["exit_pending"]:
+            return
+        if p.get("fill_xt") and xt is not None and xt <= p["fill_xt"]:
             return
         b = self.book[sym]
         levels = b["bids"] if p["side"] == "long" else b["asks"]
         wside = "bid" if p["side"] == "long" else "ask"
         q = level_qty(levels, p["wall_price"], p["tick"])
+        why = ""
         if q is None:
             if not out_of_view(wside, levels, p["wall_price"], p["tick"]):
-                p["exit_pending"] = "WALL_GONE"
+                why = "WALL_GONE"
         elif p["wall_price"] * q < p["wall_ref_usdt"] * self.c["wall_keep_pct"] / 100.0:
-            p["exit_pending"] = "WALL_SHRANK"
+            why = "WALL_SHRANK"
+        if why:
+            p["exit_pending"] = why
+            p["trigger"] = {"wall_level_usdt": round(p["wall_price"] * (q or 0), 2),
+                            "best_level": levels[0][0], "book_ms_after_fill":
+                            (xt - p["fill_xt"]) if xt and p.get("fill_xt") else None,
+                            "s_after_fill": round(ts - p["fill_ts"], 3)}
 
     def pos_trade(self, p, ts, px):
         if p["exit_pending"]:
             return
         d = 1 if p["side"] == "long" else -1
         eps = p["tick"] / 2
-        if not p["be"] and d * (px - p["wall_price"]) < -eps:
+        if not p["be"] and d * (px - p["wall_price"]) < -eps:     # strictly beyond the wall price
             p["exit_pending"] = "WALL_BROKEN"
+            p["trigger"] = {"trade_px": px, "s_after_fill": round(ts - p["fill_ts"], 3)}
             return
         p["best"] = max(p["best"], px) if d > 0 else min(p["best"], px)
-        if not p["be"] and d * (p["best"] - p["entry"]) >= p["entry"] * self.c["be_pct"] / 100.0 - 1e-12:
+        if not p["be"] and d * (p["best"] - p["entry"]) >= self.be_dist(p) - 1e-12:
             p["be"], p["stop"] = True, p["entry"]
         if p["be"]:
-            trail = p["best"] * (1 - d * self.c["trail_pct"] / 100.0)
+            trail = p["best"] - d * self.trail_dist(p)
             p["stop"] = max(p["stop"], trail) if d > 0 else min(p["stop"], trail)
             if d * (px - p["stop"]) <= 0:
                 p["exit_pending"] = "BE_STOP" if abs(p["stop"] - p["entry"]) < 1e-12 else "TRAIL_STOP"
+
+    def be_dist(self, p):
+        """Breakeven needs max(BJ_BE_PCT % of entry, BJ_BE_TICKS ticks) in profit."""
+        return max(p["entry"] * self.c["be_pct"] / 100.0, self.c["be_ticks"] * p["tick"])
+
+    def trail_dist(self, p):
+        """The trail sits max(BJ_TRAIL_PCT % of the best price, BJ_TRAIL_TICKS ticks) behind the best price."""
+        return max(p["best"] * self.c["trail_pct"] / 100.0, self.c["trail_ticks"] * p["tick"])
 
     def exit(self, sym, ts, px):
         p = self.pos.pop(sym)
@@ -497,7 +524,13 @@ class Engine:
         self.sink.event("BJ_EXIT", symbol=sym, side=p["side"], reason=reason, entry=p["entry"], exit_price=px,
                         qty=p["qty"], gross_pnl_usd=round(gross, 4), fees_usd=round(fees, 4),
                         net_pnl_usd=round(net, 4), r_multiple=round(r_mult, 2), breakeven_reached=p["be"],
-                        held_s=round(ts - p["fill_ts"], 1), session=p["session"], balance=round(st["balance"], 4))
+                        held_s=round(ts - p["fill_ts"], 1), session=p["session"], balance=round(st["balance"], 4),
+                        best_price=p["best"], stop=p["stop"], fill_trade_px=p.get("fill_px"),
+                        trigger=p.get("trigger") or {},
+                        settings={"be_pct": self.c["be_pct"], "be_ticks": self.c["be_ticks"],
+                                  "trail_pct": self.c["trail_pct"], "trail_ticks": self.c["trail_ticks"],
+                                  "be_dist": self.be_dist(p), "trail_dist": self.trail_dist(p),
+                                  "wall_keep_pct": self.c["wall_keep_pct"]})
         n = int(round(p["qty"] / p["step"])) if p["step"] else p["qty"]
         self.sink.trade_row([ist_iso(p["fill_ts"]).replace("T", " "), ist_iso(ts).replace("T", " "), "PAPER", sym,
                              p["side"].upper(), n, p["entry"], p["stop0"], "trail", px, reason, round(gross, 4),
@@ -828,9 +861,9 @@ class BookJump:
                 return
             with self.lock:
                 if msg[0] == "depth":
-                    self.eng.on_depth(msg[1], now, msg[2], msg[3])
+                    self.eng.on_depth(msg[1], now, msg[2], msg[3], msg[4])
                 else:
-                    self.eng.on_trade(msg[1], now, msg[2], msg[3], msg[4])
+                    self.eng.on_trade(msg[1], now, msg[2], msg[3], msg[4], msg[5])
         except Exception:  # noqa: BLE001
             if now - self.last_err_log > 60:
                 self.last_err_log = now
