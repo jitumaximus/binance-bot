@@ -35,6 +35,7 @@ KILL      BJ_PAUSE_HOURS (6) pause after a BJ_DAY_LOSS_PCT (3%) loss in one IST 
 SESSION   every wall / order / trade is tagged "US" (Mon-Fri 09:30-16:00 New York, the bot's in_us_session) or
           "outside". Daily summary at 00:00 IST split by session.
 """
+import copy
 import csv
 import importlib.util
 import json
@@ -193,8 +194,12 @@ def ist_day(ts):
 
 
 def new_state(start_balance):
-    return {"balance": start_balance, "start": start_balance, "since": "", "trades": 0, "wins": 0,
-            "days": {}, "loss_streak": 0, "paused_until": 0, "summary_day": "", "positions": {}}
+    """The BOOK JUMP book, stored in state.json as books["BOOK JUMP"] next to the bot's own books.
+    open_trade stays None (positions are under "positions") so the bot's per-book logic never touches it;
+    "day" is keyed by IST date (BOOK JUMP's day ends at 00:00 IST) and split by session under "s"."""
+    return {"strategy": BOOK, "start": start_balance, "balance": start_balance, "open_trade": None,
+            "day": {}, "month": {}, "trades": 0, "wins": 0, "day_tz": "IST", "since": "",
+            "positions": {}, "loss_streak": 0, "paused_until": 0, "summary_day": ""}
 
 
 # --------------------------------------------------------------------------
@@ -221,7 +226,7 @@ class Engine:
         return "US" if self.in_us(ts) else "outside"
 
     def day(self, ts):
-        return self.st["days"].setdefault(ist_day(ts), {"start_balance": round(self.st["balance"], 4), "pnl": 0.0,
+        return self.st["day"].setdefault(ist_day(ts), {"start_balance": round(self.st["balance"], 4), "pnl": 0.0,
                                                         "trades": 0, "wins": 0, "s": {}})
 
     def sess(self, ts, tag):
@@ -570,7 +575,7 @@ class Engine:
 
     # ---- reporting ----
     def day_summary(self, day):
-        d = self.st["days"].get(day, {})
+        d = self.st["day"].get(day, {})
         lines = [f"BOOK JUMP day {day} (IST) [PAPER]"]
         for tag in ("US", "outside"):
             s = (d.get("s") or {}).get(tag) or {}
@@ -585,7 +590,7 @@ class Engine:
 
     def status_text(self, ts):
         st = self.st
-        d = st["days"].get(ist_day(ts), {})
+        d = st["day"].get(ist_day(ts), {})
         lines = [f"{BOOK} [PAPER]: ${st['balance']:.2f} (start ${st['start']:.2f}) | today (IST) {d.get('trades', 0)} "
                  f"trades, ${d.get('pnl', 0.0):+.2f} | feed {'ok' if self.feed_ok else 'STALE'} | "
                  f"universe {len(self.universe)} | walls now {sum(len(x) for x in self.walls.values())}"
@@ -601,7 +606,7 @@ class Engine:
     def report_line(self, day=None):
         st = self.st
         if day:
-            d = st["days"].get(day, {})
+            d = st["day"].get(day, {})
             pnl, base, extra = d.get("pnl", 0.0), d.get("start_balance") or st["balance"], f"{d.get('trades', 0)} trades (IST day)"
         else:
             pnl, base, extra = st["balance"] - st["start"], st["start"], f"{st['trades']} trades, {st['wins']} wins"
@@ -613,10 +618,13 @@ class Engine:
 # Runner: WebSocket + timer threads, files, universe
 # --------------------------------------------------------------------------
 class BookJump:
-    def __init__(self, bot_cfg, tg, event_fn, in_us_session, rest, data_dir, bot_paused):
+    def __init__(self, bot_cfg, tg, event_fn, in_us_session, rest, data_dir, bot_paused, book_get, book_publish):
+        """book_get() -> the stored BOOK JUMP book from state.json (or None); book_publish(snapshot) puts a fresh
+        copy into state.json's books (the bot writes it to disk on its next save, every few seconds)."""
         self.bc, self.c = bot_cfg, load_cfg()
         self.tg_client, self.event_fn, self.rest = tg, event_fn, rest
-        self.state_file = os.path.join(data_dir, "bookjump_state.json")
+        self.book_get, self.book_publish = book_get, book_publish
+        self.old_state_file = os.path.join(data_dir, "bookjump_state.json")   # pre-state.json versions
         self.walls_file = os.path.join(data_dir, "walls.csv")
         self.trades_file = os.path.join(data_dir, "trades.csv")
         self.lock = threading.RLock()
@@ -665,22 +673,29 @@ class BookJump:
             csv.writer(fh).writerow(row)
 
     def save(self):
-        tmp = self.state_file + ".tmp"
-        with open(tmp, "w") as fh:
-            json.dump(self.st, fh, indent=1)
-        os.replace(tmp, self.state_file)
+        """Publish a private copy: the main thread may be writing state.json at this moment, and replacing the
+        value of an existing key (never adding one from this thread) is safe while it iterates."""
+        self.book_publish(copy.deepcopy(self.st))
         self.last_save = time.time()
 
     def load_state(self):
         st = new_state(self.c["start_balance"])
         st["since"] = datetime.now(IST).isoformat(timespec="seconds")
-        try:
-            with open(self.state_file) as fh:
-                st.update(json.load(fh))
-        except (OSError, ValueError):
-            pass
+        stored = self.book_get()
+        if stored:
+            st.update(copy.deepcopy(stored))
+        else:                                                    # migrate from bookjump_state.json (first version)
+            try:
+                with open(self.old_state_file) as fh:
+                    old = json.load(fh)
+                old["day"] = old.pop("days", {})
+                st.update(old)
+                log.info("BOOK JUMP book migrated from bookjump_state.json into state.json")
+            except (OSError, ValueError):
+                pass
+        st.update(strategy=BOOK, open_trade=None, day_tz="IST")
         cut = ist_day(time.time() - 90 * 86400)
-        st["days"] = {k: v for k, v in st["days"].items() if k >= cut}
+        st["day"] = {k: v for k, v in st["day"].items() if k >= cut}
         return st
 
     def ensure_walls_file(self):
@@ -699,12 +714,19 @@ class BookJump:
             with open(self.trades_file, "w", newline="") as fh:
                 csv.writer(fh).writerow(head)
             return
-        with open(self.trades_file) as fh:
+        with open(self.trades_file, newline="") as fh:                # keep \r\n as written by csv
             lines = fh.readlines()
-        if lines and "session" not in lines[0].split(","):
-            lines[0] = lines[0].rstrip("\r\n") + ",session\n"
-            with open(self.trades_file, "w") as fh:
+        if not lines:
+            return
+        end = lines[0][len(lines[0].rstrip("\r\n")):] or "\n"         # keep the file's own line ending (csv: \r\n)
+        cols = [c for c in lines[0].rstrip("\r\n").split(",") if c != "session"] + ["session"]
+        fixed = ",".join(cols) + end
+        if fixed != lines[0]:                                     # add it once / repair duplicates; rows untouched
+            lines[0] = fixed
+            tmp = self.trades_file + ".tmp"
+            with open(tmp, "w", newline="") as fh:
                 fh.writelines(lines)
+            os.replace(tmp, self.trades_file)
 
     # ---- universe ----
     def pick_universe(self):

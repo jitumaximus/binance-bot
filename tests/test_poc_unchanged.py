@@ -13,7 +13,8 @@ import unittest
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, HERE)
-HOOKS = {"make_cfg", "Bot.__init__", "Bot.status_text", "Bot.report", "Bot.startup"}
+HOOKS = {"make_cfg", "Bot.__init__", "Bot.status_text", "Bot.report", "Bot.startup",
+         "Bot.init_books", "Bot.sweep_retired", "Bot.wallet_line"}   # last three: skip books not in BOOKS
 ADDED = {"Bot.bookjump_setup"}
 POC_BASELINE = "7b88317"           # last commit before BOOK JUMP (bot.py as deployed 2026-11-22 08:32 UTC)
 ENV = {"EXCHANGE": "binance", "DRY_RUN": "1", "ENABLE_POC": "1", "ENABLE_SHORT": "0", "ENABLE_LONG": "0",
@@ -140,19 +141,63 @@ class PocUnchanged(unittest.TestCase):
         try:
             (bo, so), (bn, sn) = self.bots()
             import bookjump
-            bookjump.BookJump.prepare = lambda self: "BOOK JUMP [PAPER]: ON (test)"   # no network in tests
+            bookjump.BookJump.refresh_universe = lambda self: ["SOLUSDT"]    # no network in tests
             bookjump.BookJump.start = lambda self: None
             bo.startup()
             bn.startup()
             self.assertIsNotNone(bn.bj)
-            self.assertEqual(bo.state["books"], bn.state["books"])
-            self.assertNotIn("BOOK JUMP", bn.state["books"])
-            new_msg = sn[-1].replace("\nBOOK JUMP [PAPER]: ON (test)", "")
-            self.assertEqual(so[-1], new_msg)               # only the BOOK JUMP line was added
+            bj_book = bn.state["books"]["BOOK JUMP"]            # stored in state.json like the other books
+            self.assertEqual((bj_book["balance"], bj_book["start"], bj_book["open_trade"]), (100.0, 100.0, None))
+            self.assertEqual(bo.state["books"]["POC RETURN"], bn.state["books"]["POC RETURN"])
+            lines = sn[-1].split("\n")
+            bj_line = [x for x in lines if x.startswith("BOOK JUMP [PAPER]: ON")]
+            self.assertEqual(len(bj_line), 1)
+            self.assertEqual(so[-1], "\n".join(x for x in lines if x not in bj_line))   # only that line added
             self.assertIn("BOOK JUMP", bn.status_text())
             self.assertIn("BOOK JUMP (own paper book, not in ALL)", bn.report())
         finally:
             os.environ.pop("ENABLE_BOOKJUMP")
+
+    # ---- the BOOK JUMP book sits in state["books"], but the bot's book logic must ignore it ----
+    def poc_state(self, b):
+        b.state["books"] = {"POC RETURN": {"start": 120.0, "balance": 120.0, "open_trade": None, "day": {},
+                                           "month": {}, "trades": 3, "wins": 1}}
+        b.state["swept_to_wallet"] = True
+        b.state["books_since"] = "2026-11-01T00:00:00+05:30"
+
+    def test_sweep_and_init_same_as_baseline(self):
+        (bo, so), (bn, sn) = self.bots()
+        for b in (bo, bn):
+            self.poc_state(b)
+            b.state["books"]["1H BREAKOUT"] = {"start": 7.0, "balance": 7.0, "open_trade": None, "day": {},
+                                               "month": {}, "trades": 0, "wins": 0}
+            b.sweep_retired()                               # retired breakout balance moves into POC
+            b.init_books()
+        self.assertEqual(bo.state["books"], bn.state["books"])
+        self.assertEqual(so, sn)
+
+    def test_bookjump_book_never_swept_or_donor(self):
+        (bo, so), (bn, sn) = self.bots()
+        import bookjump
+        for b in (bo, bn):
+            self.poc_state(b)
+        bn.state["books"]["BOOK JUMP"] = bookjump.new_state(100.0)
+        bn.sweep_retired()
+        bo.sweep_retired()
+        self.assertEqual(bn.state["books"]["BOOK JUMP"]["balance"], 100.0)
+        self.assertEqual(bn.state["books"]["POC RETURN"], bo.state["books"]["POC RETURN"])
+        self.assertEqual(so, sn)                            # no "moved into" message
+        os.environ["ENABLE_BREAKOUT"] = "1"                 # a newly enabled strategy gets funded...
+        try:
+            for b in (bo, bn):
+                b.cfg["enable_breakout"] = True
+                b.init_books()
+            self.assertEqual(bn.state["books"]["BOOK JUMP"]["balance"], 100.0)   # ...never from BOOK JUMP
+            self.assertEqual(bn.state["books"]["1H BREAKOUT"], bo.state["books"]["1H BREAKOUT"])
+            self.assertEqual(bn.state["books"]["POC RETURN"], bo.state["books"]["POC RETURN"])
+        finally:
+            os.environ["ENABLE_BREAKOUT"] = "0"
+        self.assertNotIn("BOOK JUMP", bn.book_names())     # not in POC's status/summary loops
 
 
 if __name__ == "__main__":

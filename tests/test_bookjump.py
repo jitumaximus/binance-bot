@@ -518,7 +518,7 @@ class Misc(unittest.TestCase):
         e, s = engine()
         e.st["summary_day"] = "2026-11-17"
         self.lose = KillSwitch.lose
-        e.st["days"]["2026-11-17"] = {"start_balance": 100, "pnl": -0.5, "trades": 2, "wins": 1, "s": {
+        e.st["day"]["2026-11-17"] = {"start_balance": 100, "pnl": -0.5, "trades": 2, "wins": 1, "s": {
             "US": {"walls": 10, "walls_done": 10, "pulled": 6, "touched_held": 2, "orders": 3, "fills": 2,
                    "trades": 2, "wins": 1, "pnl": -0.5}}}
         e.on_timer(datetime(2026, 11, 18, 0, 0, 1, tzinfo=bj.IST).timestamp())
@@ -554,6 +554,83 @@ class Files(unittest.TestCase):
             with open(r.walls_file) as fh:
                 rows = list(csv.reader(fh))
             self.assertEqual((rows[0], len(rows)), (bj.WALL_COLS, 2))
+
+
+class Persistence(unittest.TestCase):
+    HEAD = ("open_time_ist,close_time_ist,mode,symbol,side,contracts,entry,stop_loss,take_profit,exit_price,"
+            "exit_reason,gross_pnl_usd,est_fees_usd,net_pnl_usd,net_pnl_inr,r_multiple,rsi_4h,exit_estimated,"
+            "ob_ratio,strategy,book_balance_usd")
+
+    def runner(self, d, store):
+        r = bj.BookJump.__new__(bj.BookJump)
+        r.trades_file, r.walls_file = os.path.join(d, "trades.csv"), os.path.join(d, "walls.csv")
+        r.old_state_file = os.path.join(d, "bookjump_state.json")
+        r.c = bj.load_cfg({})
+        r.book_get, r.book_publish = (lambda: store.get("BOOK JUMP")), (lambda s: store.__setitem__("BOOK JUMP", s))
+        return r
+
+    def check_header(self, first_line):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            r = self.runner(d, {})
+            rows = ["2026-11-20 10:00 IST,2026-11-20 11:00 IST,PAPER,ETHUSDT,LONG,1,1,1,1,1,X,1,0,1,85,1,,True,,POC RETURN,120\r\n"] * 3
+            with open(r.trades_file, "w", newline="") as fh:
+                fh.write(first_line)
+                fh.writelines(rows)
+            r.ensure_trades_header()
+            r.ensure_trades_header()                         # idempotent over restarts
+            with open(r.trades_file, newline="") as fh:
+                got = fh.readlines()
+            self.assertEqual(got[0], self.HEAD + ",session\r\n")
+            self.assertEqual(got[1:], rows)                   # rows kept byte for byte
+
+    def test_header_added_once(self):
+        self.check_header(self.HEAD + "\r\n")
+
+    def test_header_duplicate_repaired(self):
+        self.check_header(self.HEAD + ",session,session\r\n")
+
+    def test_header_with_lf_endings(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            r = self.runner(d, {})
+            with open(r.trades_file, "w", newline="") as fh:
+                fh.write(self.HEAD + ",session,session\nrow\n")
+            r.ensure_trades_header()
+            with open(r.trades_file, newline="") as fh:
+                self.assertEqual(fh.read(), self.HEAD + ",session\nrow\n")
+
+    def test_book_round_trip_through_state(self):
+        import tempfile
+        store = {}
+        with tempfile.TemporaryDirectory() as d:
+            r = self.runner(d, store)
+            r.st = r.load_state()
+            r.st["balance"], r.st["trades"] = 101.25, 4
+            r.st["day"]["2026-11-22"] = {"start_balance": 100, "pnl": 1.25, "trades": 4, "wins": 3, "s": {}}
+            r.st["positions"][SYM] = {"sym": SYM, "side": "long"}
+            r.save()
+            snap = store["BOOK JUMP"]
+            self.assertIsNot(snap, r.st)                      # a private copy, safe for the main thread's save
+            r.st["balance"] = 0
+            self.assertEqual(snap["balance"], 101.25)
+            self.assertEqual((snap["open_trade"], snap["strategy"]), (None, "BOOK JUMP"))
+            r2 = self.runner(d, store)                        # restart: restored from state.json
+            st2 = r2.load_state()
+            self.assertEqual((st2["balance"], st2["trades"], list(st2["positions"])), (101.25, 4, [SYM]))
+            self.assertEqual(st2["day"]["2026-11-22"]["pnl"], 1.25)
+
+    def test_migrates_old_state_file(self):
+        import tempfile
+        store = {}
+        with tempfile.TemporaryDirectory() as d:
+            r = self.runner(d, store)
+            with open(r.old_state_file, "w") as fh:
+                json.dump({"balance": 99.5, "start": 100, "trades": 2, "wins": 0, "summary_day": "2026-11-22",
+                           "days": {"2026-11-22": {"pnl": -0.5}}, "positions": {}}, fh)
+            st = r.load_state()
+            self.assertEqual((st["balance"], st["day"], st["summary_day"]), (99.5, {"2026-11-22": {"pnl": -0.5}}, "2026-11-22"))
+            self.assertNotIn("days", st)
 
 
 class RecordedStream(unittest.TestCase):

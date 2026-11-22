@@ -12,7 +12,7 @@ other (switched-off) strategies in detail. `bookjump.py` is the BOOK JUMP strate
 | `trades.csv` | every closed trade, all strategies (`strategy` column = book name; `session` column for BOOK JUMP) |
 | `events.jsonl` | event log (one JSON object per line) |
 | `walls.csv` | BOOK JUMP: every wall seen |
-| `state.json` / `bookjump_state.json` | bot state / BOOK JUMP's own book and stats |
+| `state.json` | bot state; `books` holds every book incl. `BOOK JUMP` (balance, start, IST day stats by session, open positions, kill-switch state) |
 
 Run: `venv/bin/python bot.py` (normally via systemd). Checks: `venv/bin/python bot.py --selftest`.
 Tests: `venv/bin/python -m unittest discover -s tests -v` and `venv/bin/python -m pyflakes bot.py bookjump.py tests`.
@@ -21,7 +21,8 @@ Telegram commands: `/status /summary /pause /resume /killswitch`.
 
 ## BOOK JUMP (order-book penny-jumping, paper only)
 
-Runs 24/7 next to POC RETURN, in its own threads, with its own book and state file: POC is not affected
+Runs 24/7 next to POC RETURN, in its own threads, with its own book (`state.json` → `books["BOOK JUMP"]`, never
+swept into or used to fund other books): POC is not affected
 (`tests/test_poc_unchanged.py` checks that every POC function is identical to the version before BOOK JUMP).
 
 - **Start**: `ENABLE_BOOKJUMP=1`. Refuses to start unless `DRY_RUN=1` and `EXCHANGE=binance`; the start-up Telegram
@@ -56,7 +57,9 @@ Runs 24/7 next to POC RETURN, in its own threads, with its own book and state fi
 - **Kill switch**: `BJ_PAUSE_HOURS` pause after a `BJ_DAY_LOSS_PCT` % loss in one IST day, `BJ_MAX_LOSS_STREAK`
   losses in a row, or a stale feed; resting orders cancelled, open positions closed at the next trade. Telegram on
   pause and resume. The bot's `/pause` also stops new BOOK JUMP entries (open positions keep being managed).
-- **Restart**: a BOOK JUMP position left open by a restart is closed at the first trade after start-up (`RESTART`).
+- **Restart**: the book (balance, day stats, kill-switch pause, open positions) is restored from `state.json`; a position
+  left open by a restart is closed at the first trade after start-up (`RESTART`). The first version's
+  `bookjump_state.json` is migrated once and then no longer used.
 - **Sessions**: every wall, order and trade is tagged `US` (Mon-Fri 09:30-16:00 New York, the bot's
   `in_us_session`) or `outside`.
 

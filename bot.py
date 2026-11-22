@@ -1089,7 +1089,8 @@ class Bot:
             for n in on:
                 if n in self.state["books"]:
                     continue
-                donors = [(b["balance"], m) for m, b in self.state["books"].items() if not b["open_trade"]]
+                donors = [(b["balance"], m) for m, b in self.state["books"].items()
+                          if not b["open_trade"] and m in BOOKS]           # BOOK JUMP's own book never donates
                 if not donors:
                     self.state["books"][n] = self.new_book(0.0)
                     continue
@@ -1153,13 +1154,13 @@ class Bot:
         tgt = self.book(on[0])
         moved = []
         for n, b in self.state["books"].items():
-            if n == on[0] or b["open_trade"] or abs(b["balance"]) < 1e-9:
-                continue
+            if n == on[0] or n not in BOOKS or b["open_trade"] or abs(b["balance"]) < 1e-9:
+                continue                                    # BOOK JUMP's own book is never swept
             moved.append(f"{n} ${b['balance']:.2f}")
             tgt["balance"] = round(tgt["balance"] + b["balance"], 4)
             tgt["start"] = round(tgt["start"] + b["balance"], 4)
             b["balance"], b["start"] = 0.0, 0.0
-        others_open = any(b["open_trade"] for n, b in self.state["books"].items() if n != on[0])
+        others_open = any(b["open_trade"] for n, b in self.state["books"].items() if n != on[0] and n in BOOKS)
         if (moved or not self.state.get("swept_to_wallet")) and not others_open and not tgt["open_trade"]:
             msg = ""
             if not self.cfg["dry_run"]:
@@ -1269,7 +1270,7 @@ class Bot:
         try:
             self.last_equity_ts = 0
             w = self.equity_usd()
-            return f"Delta wallet: ${w:.2f} (books total ${sum(b['balance'] for b in self.state['books'].values()):.2f})\n"
+            return f"Delta wallet: ${w:.2f} (books total ${sum(b['balance'] for n, b in self.state['books'].items() if n in BOOKS):.2f})\n"
         except Exception as ex:  # noqa: BLE001
             log.warning("wallet lookup failed: %s", ex)
             return ""
@@ -2613,9 +2614,12 @@ class Bot:
             self.event("BJ_REFUSED", reason=why)
             return f"\nBOOK JUMP: NOT started - it only runs in paper mode on Binance ({why})."
         try:
+            books = self.state["books"]
             self.bj = bookjump.BookJump(c, self.tg, self.event, self.in_us_session,
                                         Binance("https://fapi.binance.com", "", "", c["ua"]), c["data_dir"],
-                                        lambda: bool(self.state.get("paused")))
+                                        lambda: bool(self.state.get("paused")),
+                                        lambda: books.get(bookjump.BOOK),
+                                        lambda snap: books.__setitem__(bookjump.BOOK, snap))
             return "\n" + self.bj.prepare()
         except Exception as ex:  # noqa: BLE001
             self.bj = None
