@@ -146,15 +146,20 @@ class PocUnchanged(unittest.TestCase):
             bo.startup()
             bn.startup()
             self.assertIsNotNone(bn.bj)
-            bj_book = bn.state["books"]["BOOK JUMP"]            # stored in state.json like the other books
-            self.assertEqual((bj_book["balance"], bj_book["start"], bj_book["open_trade"]), (100.0, 100.0, None))
+            for name in ("BOOK JUMP", "BJ ABSORB"):              # stored in state.json like the other books
+                bk = bn.state["books"][name]
+                self.assertEqual((bk["balance"], bk["start"], bk["open_trade"], bk["strategy"]),
+                                 (100.0, 100.0, None, name))
             self.assertEqual(bo.state["books"]["POC RETURN"], bn.state["books"]["POC RETURN"])
             lines = sn[-1].split("\n")
-            bj_line = [x for x in lines if x.startswith("BOOK JUMP [PAPER]: ON")]
-            self.assertEqual(len(bj_line), 1)
-            self.assertEqual(so[-1], "\n".join(x for x in lines if x not in bj_line))   # only that line added
-            self.assertIn("BOOK JUMP", bn.status_text())
+            bj_line = [x for x in lines if x.startswith(("BOOK JUMP [PAPER]: ON", "BJ ABSORB [PAPER]: ON"))]
+            self.assertEqual(len(bj_line), 2)
+            self.assertEqual(so[-1], "\n".join(x for x in lines if x not in bj_line))   # only those lines added
+            self.assertIn("BOOK JUMP [PAPER]", bn.status_text())
+            self.assertIn("BJ ABSORB [PAPER]", bn.status_text())
             self.assertIn("BOOK JUMP (own paper book, not in ALL)", bn.report())
+            self.assertIn("BJ ABSORB (own paper book, not in ALL)", bn.report())
+            self.assertNotIn("BJ ABSORB", bn.book_names())     # never in POC's book logic
         finally:
             os.environ.pop("ENABLE_BOOKJUMP")
 

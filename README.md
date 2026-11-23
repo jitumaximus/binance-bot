@@ -2,17 +2,17 @@
 
 Paper trading bot on Binance USDT-M perpetuals (systemd service `binance-bot`, folder `~/binance-bot`).
 `bot.py` holds the strategies, accounting, Telegram and logging; its docstring describes POC RETURN and the
-other (switched-off) strategies in detail. `bookjump.py` is the BOOK JUMP strategy.
+other (switched-off) strategies in detail. `bookjump.py` holds the BOOK JUMP and BJ ABSORB strategies.
 
 | File | What |
 |---|---|
 | `bot.py` | main bot: POC RETURN (+ RSI / breakout strategies, off in this deployment), books, Telegram, logs |
-| `bookjump.py` | BOOK JUMP order-book penny-jumping, paper only, started by `bot.py` when `ENABLE_BOOKJUMP=1` |
+| `bookjump.py` | BOOK JUMP and BJ ABSORB order-book wall strategies, paper only, started by `bot.py` when `ENABLE_BOOKJUMP=1` |
 | `.env` | settings and keys (never committed); see `.env.example` for every setting and its default |
-| `trades.csv` | every closed trade, all strategies (`strategy` column = book name; `session` column for BOOK JUMP) |
+| `trades.csv` | every closed trade, all strategies (`strategy` column = book name; `session` and `shadow_exit_pnl` columns for BOOK JUMP / BJ ABSORB) |
 | `events.jsonl` | event log (one JSON object per line) |
-| `walls.csv` | BOOK JUMP: every wall seen |
-| `state.json` | bot state; `books` holds every book incl. `BOOK JUMP` (balance, start, IST day stats by session, open positions, kill-switch state) |
+| `walls.csv` | every wall seen (incl. BJ ABSORB's absorption result) |
+| `state.json` | bot state; `books` holds every book incl. `BOOK JUMP` and `BJ ABSORB` (balance, start, IST day stats by session, open positions, pause state) |
 
 Run: `venv/bin/python bot.py` (normally via systemd). Checks: `venv/bin/python bot.py --selftest`.
 Tests: `venv/bin/python -m unittest discover -s tests -v` and `venv/bin/python -m pyflakes bot.py bookjump.py tests`.
@@ -50,36 +50,69 @@ swept into or used to fund other books): POC is not affected
 - **Paper fill**: queue ahead = size already resting at our price when placed. Filled when a trade prints through
   our price, or when aggressive trades at our price (sells for a buy) exceed that queue. Filled at our price.
 - **Exit** (all at the next trade price after the trigger, as a market order; the trade that fills us never
-  triggers an exit):
-  before breakeven: the wall level is missing (`WALL_GONE`) or below `BJ_WALL_KEEP_PCT` % of its size at the fill
-  (`WALL_SHRANK`), judged only from book snapshots taken after the fill (Binance event time, because depth and
-  trades arrive on separate sockets), or a trade prints strictly beyond the wall price (`WALL_BROKEN`);
+  triggers an exit): hard stop at max(`BJ_STOP_PCT` %, `BJ_STOP_TICKS` ticks) from entry, checked on trade prints
+  (`HARD_STOP`; the same distance sizes the trade, so a full stop loses about `BJ_RISK_PCT` % plus fees);
   breakeven once the trade is >= `BJ_BE_PCT` % AND >= `BJ_BE_TICKS` ticks in profit: stop to entry, then it trails
   max(`BJ_TRAIL_PCT` %, `BJ_TRAIL_TICKS` ticks) behind the best price since entry (only tightens); time stop after
   `BJ_TIME_STOP_SEC` if breakeven not reached. Every `BJ_EXIT` event logs these settings, the distances used, the
   best price, the final stop, the fill trade's price and what triggered the exit.
+- **Shadow wall exit** (logged, never acted on): the old exits - wall level gone (`WALL_GONE`), below
+  `BJ_WALL_KEEP_PCT` % of its size at the fill (`WALL_SHRANK`, judged only from book snapshots after the fill by Binance
+  event time) or a trade strictly beyond the wall (`WALL_BROKEN`), before breakeven. The first time one would have
+  fired, `BJ_WALL_EXIT_SHADOW` records the time, the next trade's price (where the old rule exited), the net P&L
+  then, the trigger and the volume traded at the wall since the fill; trades.csv gets it as `shadow_exit_pnl`.
 - **Costs**: entry maker `BJ_MAKER_PCT` % + `BJ_GST_PCT` % GST; exit taker `BJ_TAKER_PCT` % + GST.
-- **Kill switch**: `BJ_PAUSE_HOURS` pause after a `BJ_DAY_LOSS_PCT` % loss in one IST day, `BJ_MAX_LOSS_STREAK`
-  losses in a row, or a stale feed; resting orders cancelled, open positions closed at the next trade. Telegram on
-  pause and resume. The bot's `/pause` also stops new BOOK JUMP entries (open positions keep being managed).
-- **Restart**: the book (balance, day stats, kill-switch pause, open positions) is restored from `state.json`; a position
+- **Pause**: no pause on losses (removed 23 Nov 2026). Only a stale feed pauses: no data for `BJ_STALE_KILL_SEC` ->
+  `BJ_PAUSE_HOURS` pause of both books, resting orders cancelled, open positions closed at the next trade. Telegram
+  on pause and resume. A pause from before a restart is cleared at start-up. The bot's `/pause` also stops new
+  entries (open positions keep being managed).
+- **Restart**: the book (balance, day stats, open positions) is restored from `state.json`; a position
   left open by a restart is closed at the first trade after start-up (`RESTART`). The first version's
   `bookjump_state.json` is migrated once and then no longer used.
 - **Sessions**: every wall, order and trade is tagged `US` (Mon-Fri 09:30-16:00 New York, the bot's
   `in_us_session`) or `outside`.
+
+## BJ ABSORB (wall absorption, paper only)
+
+Second paper book (`state.json` -> `books["BJ ABSORB"]`, `BJA_START_BALANCE` $100, `BJA_RISK_PCT` 1%), started
+with BOOK JUMP (`BJA_ENABLE=0` turns it off). Same feed, coins and wall rule (top-5 level >= 5x average AND >= $25k,
+persisting 3 s), same fills, sizing and exits (hard stop, breakeven, trail, time stop, shadow wall exit, no loss
+pause). It enters only after the wall has proved itself:
+- **Setup**: from the first trade at a seen wall's price, count the volume traded at that price that hits it
+  (bid wall: aggressive sells; ask wall: aggressive buys). One setup per wall.
+- **Absorbed** when, within `BJA_WINDOW_SEC` (60 s) of the first touch, that volume >= `BJA_ABSORB_PCT` (30%) of the
+  wall's size at the first touch, the wall is still >= `BJA_KEEP_PCT` (50%) of that size and nothing printed beyond
+  it, and all of it is still true `BJA_CONFIRM_S` (2 s) later.
+- **Dropped** (logged with the reason): `dropped_pulled` (level gone, or under 50% with most of the reduction
+  cancelled rather than traded), `dropped_shrank` (under 50%, mostly traded into), `dropped_broke` (a trade beyond
+  the wall), `timeout` (not absorbed within 60 s), `dropped_feed`; absorbed but not entered: `skipped_busy` (order or
+  position on the coin), `skipped_max_open`, `skipped_paused`, `skipped_not_passive`, `skipped_size`.
+- **Entry**: post-only limit 1 tick in front of the wall, same queue fill rule; cancelled if not filled within
+  `BJA_ORDER_TIMEOUT_SEC` (10 s) or price moves more than `BJA_AWAY_TICKS` (3) ticks away. BOOK JUMP's own wall
+  tracker ending the wall (e.g. absorbed below the 5x / $25k bar) does not cancel it.
+- **Logs**: events `BJA_SETUP`, `BJA_ABSORBED`, `BJA_DROP` (reason), `BJA_ORDER`, `BJA_FILL`, `BJA_CANCEL`,
+  `BJA_EXIT`, `BJA_WALL_EXIT_SHADOW`, `BJA_KILL`, all with the session tag; trades.csv rows with strategy
+  `BJ ABSORB`; walls.csv `absorbed_usdt`, `absorbed_pct`, `absorb_result` (`entered` / `dropped_*` / `timeout` /
+  `skipped_*`; empty if never touched). `/status`, the bot's summaries and its own 00:00 IST day summary show it as
+  its own book.
 
 ### Logs
 - `walls.csv`: one row per wall seen, written 300 s after it was confirmed: `time_ist` (when it had persisted
   `BJ_PERSIST_SEC`), `session`, `symbol`, `side`, `price`, `size_usdt`, `multiple` (at confirmation), `lifetime_s`
   (from first appearance), `outcome` (`pulled` = gone without a trade at its price, `touched` = traded at, then gone,
   `still there` at +300 s, `feed lost`), `mid_10s` / `mid_60s` / `mid_300s` (mid price that long after confirmation),
-  plus `touched`, `broke_through` (a trade printed beyond it) and `bj_order` (`order` / `filled` if BOOK JUMP used it).
+  plus `touched`, `broke_through` (a trade printed beyond it), `bj_order` (`order` / `filled` if BOOK JUMP used it)
+  and `absorbed_usdt` / `absorbed_pct` / `absorb_result` (BJ ABSORB; a row waits until its setup has a result).
 - `trades.csv`: BOOK JUMP trades with the existing columns (`strategy` = `BOOK JUMP`, `est_fees_usd` incl. GST,
-  `exit_reason`: WALL_GONE / WALL_SHRANK / WALL_BROKEN / BE_STOP / TRAIL_STOP / TIME_STOP / KILL / RESTART) plus `session`.
-- `events.jsonl`: `BJ_ORDER`, `BJ_CANCEL` (reason), `BJ_FILL`, `BJ_EXIT`, `BJ_KILL`, `BJ_FEED`, `BJ_UNIVERSE`, `BJ_REFUSED`.
-- Telegram: fills and exits (one line each), kill switch pause/resume, feed stale/back, and at 00:00 IST a day summary
-  split by session: walls seen, % pulled, % touched-and-held (touched, never traded through), orders, fills, trades,
-  win rate, P&L. `/status` and the bot's summaries include a BOOK JUMP line (not part of the "ALL" total).
+  `exit_reason`: HARD_STOP / BE_STOP / TRAIL_STOP / TIME_STOP / KILL / RESTART) plus `session` and `shadow_exit_pnl`
+  (net P&L had the old wall rule exited; empty if it never fired). Rows before 23 Nov have WALL_* reasons.
+- `events.jsonl`: `BJ_ORDER`, `BJ_CANCEL` (reason), `BJ_FILL`, `BJ_EXIT`, `BJ_WALL_EXIT_SHADOW`, `BJ_KILL`, `BJ_FEED`,
+  `BJ_UNIVERSE`, `BJ_REFUSED` (and the `BJA_*` events above).
+- Telegram: fills and exits (one line each; the exit line adds what the old wall rule would have made), stale-feed
+  pause/resume, feed stale/back, and at 00:00 IST a day summary per book split by session (BOOK JUMP: walls seen,
+  % pulled, % touched-and-held, orders, fills, trades, win rate, P&L; BJ ABSORB: setups, absorbed, dropped, orders,
+  fills, trades, win rate, P&L). `/status` and the bot's summaries include a BOOK JUMP and a BJ ABSORB line (not part
+  of the "ALL" total).
 
 ### Settings
 All `BJ_*` settings with defaults are in `.env.example`.

@@ -2605,7 +2605,8 @@ class Bot:
 
     # ---- BOOK JUMP (bookjump.py) ----
     def bookjump_setup(self):
-        """ENABLE_BOOKJUMP=1: create the BOOK JUMP runner (paper mode on Binance only). Returns the start-up line."""
+        """ENABLE_BOOKJUMP=1: create the BOOK JUMP runner (BOOK JUMP + BJ ABSORB books, paper mode on Binance only).
+        Returns the start-up line(s)."""
         c = self.cfg
         if not c["enable_bookjump"]:
             return ""
@@ -2618,8 +2619,8 @@ class Bot:
             self.bj = bookjump.BookJump(c, self.tg, self.event, self.in_us_session,
                                         Binance("https://fapi.binance.com", "", "", c["ua"]), c["data_dir"],
                                         lambda: bool(self.state.get("paused")),
-                                        lambda: books.get(bookjump.BOOK),
-                                        lambda snap: books.__setitem__(bookjump.BOOK, snap))
+                                        lambda name=bookjump.BOOK: books.get(name),
+                                        lambda snap, name=bookjump.BOOK: books.__setitem__(name, snap))
             return "\n" + self.bj.prepare()
         except Exception as ex:  # noqa: BLE001
             self.bj = None

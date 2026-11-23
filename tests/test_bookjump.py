@@ -252,37 +252,83 @@ class Exits(unittest.TestCase):
     def exit_of(self, s):
         return s.last("BJ_EXIT")
 
-    def test_wall_gone_exits_at_next_trade(self):
+    # entry 99.98, tick 0.01: hard stop = max(0.4% = 0.39992, 10 ticks) -> 99.58008; size 1% of $100 / 0.39992
+    # = 2.5005 -> 2.5 (step 0.1; the 3x notional cap 3.0006 does not bind)
+    STOP = 99.98 - 99.98 * 0.004
+    QTY = 2.5
+
+    def test_size_and_stop_from_the_same_distance(self):
         e, s = engine()
-        filled_long(e)
+        o = place_long(e)
+        self.assertAlmostEqual(o["stop"], self.STOP)
+        self.assertAlmostEqual(o["qty"], self.QTY)
+        self.assertAlmostEqual(s.last("BJ_ORDER")["stop"], self.STOP)
+
+    def test_wall_gone_is_shadow_only(self):
+        e, s = engine()
+        p = filled_long(e)
         e.on_depth(SYM, T_OUT + 4, *without(book(100.00), 99.97))     # level removed entirely
-        self.assertEqual(e.pos[SYM]["exit_pending"], "WALL_GONE")
+        self.assertEqual(p["exit_pending"], "")                         # no exit any more
+        self.assertEqual(p["shadow"]["reason"], "WALL_GONE")
+        self.assertNotIn("BJ_WALL_EXIT_SHADOW", s.names())              # priced at the NEXT trade, like the old exit
         e.on_trade(SYM, T_OUT + 4.1, 99.95, 1, True)
-        x = self.exit_of(s)
-        self.assertEqual((x["reason"], x["exit_price"]), ("WALL_GONE", 99.95))
-        qty = 3.0
-        fees = 99.98 * qty * 0.0002 * 1.18 + 99.95 * qty * 0.0005 * 1.18
-        self.assertAlmostEqual(x["fees_usd"], round(fees, 4))
-        self.assertAlmostEqual(x["net_pnl_usd"], round(-0.03 * qty - fees, 4))
-        self.assertAlmostEqual(e.st["balance"], 100 - 0.03 * qty - fees, places=5)
-
-    def test_wall_shrank_below_half(self):
-        e, s = engine()
-        filled_long(e)
-        e.on_depth(SYM, T_OUT + 4, *book(100.00, 99.97, wall_q=210))   # 52% of 400: still fine
-        self.assertEqual(e.pos[SYM]["exit_pending"], "")
-        e.on_depth(SYM, T_OUT + 4.1, *book(100.00, 99.97, wall_q=190))
-        self.assertEqual(e.pos[SYM]["exit_pending"], "WALL_SHRANK")
-
-    def test_trade_below_wall(self):
-        e, s = engine()
-        filled_long(e)
-        e.on_trade(SYM, T_OUT + 4, 99.97, 1, True)          # at the wall: fine
-        self.assertEqual(e.pos[SYM]["exit_pending"], "")
-        e.on_trade(SYM, T_OUT + 4.1, 99.96, 1, True)        # through it: exit at the NEXT trade
+        sh = s.last("BJ_WALL_EXIT_SHADOW")
+        fees = 99.98 * self.QTY * 0.0002 * 1.18 + 99.95 * self.QTY * 0.0005 * 1.18
+        self.assertEqual((sh["reason"], sh["price"], sh["session"]), ("WALL_GONE", 99.95, "outside"))
+        self.assertAlmostEqual(sh["pnl_usd"], round(-0.03 * self.QTY - fees, 4))
+        self.assertEqual(sh["time"], bj.ist_iso(T_OUT + 4.1))
         self.assertIn(SYM, e.pos)
+        self.assertNotIn("BJ_EXIT", s.names())
+        e.on_depth(SYM, T_OUT + 4.2, *without(book(100.00), 99.97))
+        e.on_trade(SYM, T_OUT + 4.3, 99.94, 1, True)
+        self.assertEqual(s.names().count("BJ_WALL_EXIT_SHADOW"), 1)   # only the first time the old rule fires
+
+    def test_wall_shrank_is_shadow_only(self):
+        e, s = engine()
+        p = filled_long(e)
+        e.on_depth(SYM, T_OUT + 4, *book(100.00, 99.97, wall_q=210))   # 52% of 400: still fine
+        self.assertIsNone(p["shadow"])
+        e.on_depth(SYM, T_OUT + 4.1, *book(100.00, 99.97, wall_q=190))
+        self.assertEqual((p["shadow"]["reason"], p["exit_pending"]), ("WALL_SHRANK", ""))
+
+    def test_trade_below_wall_is_shadow_only(self):
+        e, s = engine()
+        p = filled_long(e)
+        e.on_trade(SYM, T_OUT + 4, 99.97, 1, True)          # at the wall: fine
+        self.assertIsNone(p["shadow"])
+        e.on_trade(SYM, T_OUT + 4.1, 99.96, 1, True)        # through it: shadow, priced at the NEXT trade
+        self.assertEqual(p["shadow"]["reason"], "WALL_BROKEN")
         e.on_trade(SYM, T_OUT + 4.2, 99.94, 1, True)
-        self.assertEqual((self.exit_of(s)["reason"], self.exit_of(s)["exit_price"]), ("WALL_BROKEN", 99.94))
+        self.assertEqual((s.last("BJ_WALL_EXIT_SHADOW")["reason"], s.last("BJ_WALL_EXIT_SHADOW")["price"]),
+                         ("WALL_BROKEN", 99.94))
+        self.assertEqual(s.last("BJ_WALL_EXIT_SHADOW")["traded_at_wall_usdt"], round(99.97, 2))
+        self.assertIn(SYM, e.pos)
+
+    def test_hard_stop(self):
+        e, s = engine()
+        p = filled_long(e)
+        e.on_trade(SYM, T_OUT + 4, 99.59, 1, True)          # above 99.58008: holds
+        self.assertEqual(p["exit_pending"], "")
+        e.on_trade(SYM, T_OUT + 4.1, 99.58, 1, True)        # at/through the stop: exit at the NEXT trade
+        self.assertEqual(p["exit_pending"], "HARD_STOP")
+        e.on_trade(SYM, T_OUT + 4.2, 99.57, 1, True)
+        x = s.last("BJ_EXIT")
+        self.assertEqual((x["reason"], x["exit_price"]), ("HARD_STOP", 99.57))
+        self.assertAlmostEqual(x["r_multiple"], round(-0.41 / (99.98 * 0.004), 2))
+        st = x["settings"]
+        self.assertEqual((st["stop_pct"], st["stop_ticks"]), (0.4, 10))
+        self.assertAlmostEqual(st["stop_dist"], 99.98 * 0.004)
+        self.assertAlmostEqual(x["stop0"], self.STOP)
+        self.assertEqual(x["shadow_wall_exit"]["reason"], "WALL_BROKEN")   # 99.59 was already beyond the wall
+
+    def test_hard_stop_ticks_bind_on_coarse_tick(self):
+        # entry 0.998, tick 0.001: 0.4% = 0.003992 < 10 ticks = 0.010 -> stop 0.988; size $1 / 0.010 = 100
+        e, s = engine()
+        e.set_universe({"CTUSDT": {"tick": 0.001, "step": 1, "min_notional": 5}}, ["CTUSDT"])
+        for k in range(31):
+            e.on_depth("CTUSDT", T_OUT + k * 0.1, *coarse_book(1.000, 0.997))
+        o = e.orders["CTUSDT"]
+        self.assertEqual((round(o["stop"], 6), o["qty"]), (0.988, 100))
 
     def test_breakeven_then_trail(self):
         # entry 99.98, tick 0.01: BE = max(0.15% = 0.14997, 5 ticks) -> +0.15; trail = max(0.3% of best, 8 ticks)
@@ -374,24 +420,42 @@ class Exits(unittest.TestCase):
         self.assertEqual((x["reason"], x["exit_price"]), ("TRAIL_STOP", 99.81))
         self.assertGreater(x["gross_pnl_usd"], 0)
 
-    def test_short_wall_broken(self):
+    def test_short_hard_stop_and_shadow(self):
         e, s = engine()
         for k in range(31):
             e.on_depth(SYM, T_OUT + k * 0.1, *book(100.00, 100.03, side="ask"))
-        e.on_trade(SYM, T_OUT + 3.2, 100.03, 1, False)
-        e.on_trade(SYM, T_OUT + 4, 100.04, 1, False)        # above the ask wall
+        e.on_trade(SYM, T_OUT + 3.2, 100.03, 1, False)      # filled at 100.02, stop 100.02 + 0.40008
+        p = e.pos[SYM]
+        self.assertAlmostEqual(p["stop"], 100.02 * 1.004)
+        e.on_trade(SYM, T_OUT + 4, 100.04, 1, False)        # above the ask wall: shadow only
         e.on_trade(SYM, T_OUT + 4.1, 100.05, 1, False)
-        self.assertEqual(self.exit_of(s)["reason"], "WALL_BROKEN")
+        self.assertEqual(s.last("BJ_WALL_EXIT_SHADOW")["reason"], "WALL_BROKEN")
+        self.assertNotIn("BJ_EXIT", s.names())
+        e.on_trade(SYM, T_OUT + 5, 100.43, 1, False)        # >= 100.42008
+        e.on_trade(SYM, T_OUT + 5.1, 100.44, 1, False)
+        self.assertEqual(s.last("BJ_EXIT")["reason"], "HARD_STOP")
 
     def test_trades_csv_row(self):
         e, s = engine()
         filled_long(e)
-        e.on_depth(SYM, T_OUT + 4, *book(100.00))
-        e.on_trade(SYM, T_OUT + 4.1, 99.95, 1, True)
+        e.on_depth(SYM, T_OUT + 4, *book(100.00))           # wall gone: shadow
+        e.on_trade(SYM, T_OUT + 4.1, 99.95, 1, True)        # shadow priced
+        e.on_trade(SYM, T_OUT + 5, 99.50, 1, True)          # hard stop
+        e.on_trade(SYM, T_OUT + 5.1, 99.49, 1, True)
         row = s.trades[-1]
-        self.assertEqual(len(row), 22)
+        self.assertEqual(len(row), len(bj.TRADE_HEAD + bj.TRADE_TAIL))
         self.assertEqual((row[3], row[4], row[5], row[10], row[19], row[21]),
-                         (SYM, "LONG", 30, "WALL_SHRANK", "BOOK JUMP", "outside"))   # 400 -> 10 lots left
+                         (SYM, "LONG", 25, "HARD_STOP", "BOOK JUMP", "outside"))
+        self.assertEqual(row[22], s.last("BJ_WALL_EXIT_SHADOW")["pnl_usd"])
+        self.assertLess(row[22], 0)
+
+    def test_trades_csv_row_without_shadow(self):
+        e, s = engine()
+        p = filled_long(e)
+        e.on_timer(p["fill_ts"] + 300)
+        e.on_trade(SYM, p["fill_ts"] + 301, 99.99, 1, False)
+        self.assertEqual((s.trades[-1][10], s.trades[-1][22]), ("TIME_STOP", ""))
+        self.assertIsNone(s.last("BJ_EXIT")["shadow_wall_exit"])
 
 
 class SuiCase(unittest.TestCase):
@@ -439,20 +503,21 @@ class SuiCase(unittest.TestCase):
     def test_wall_shrank_after_fill(self):
         e, s, p = self.filled_short()
         e.on_depth(self.SUI, T_OUT + 8.2, *self.sui_book(wall_q=self.WALL_Q * 0.51), xt=1_008_100)   # 51%: hold
-        self.assertEqual(p["exit_pending"], "")
+        self.assertIsNone(p["shadow"])
         e.on_depth(self.SUI, T_OUT + 8.3, *self.sui_book(wall_q=self.WALL_Q * 0.49), xt=1_008_200)   # 49%
-        self.assertEqual(p["exit_pending"], "WALL_SHRANK")
+        self.assertEqual((p["shadow"]["reason"], p["exit_pending"]), ("WALL_SHRANK", ""))
         e.on_trade(self.SUI, T_OUT + 8.4, 0.6551, 10, False, xt=1_008_300)
-        x = s.last("BJ_EXIT")
-        self.assertEqual(x["reason"], "WALL_SHRANK")
-        self.assertEqual(x["trigger"]["book_ms_after_fill"], 200)
-        self.assertEqual(x["fill_trade_px"], 0.6551)
+        sh = s.last("BJ_WALL_EXIT_SHADOW")
+        self.assertEqual((sh["reason"], sh["price"]), ("WALL_SHRANK", 0.6551))
+        self.assertEqual(sh["trigger"]["book_ms_after_fill"], 200)
+        self.assertEqual(sh["traded_at_wall_usdt"], round(0.6551 * 10, 2))
+        self.assertIn(self.SUI, e.pos)
 
     def test_wall_gone_after_fill(self):
         e, s, p = self.filled_short()
         e.on_depth(self.SUI, T_OUT + 8.2, *self.sui_book(drop_wall=True), xt=1_008_100)
-        self.assertEqual(p["exit_pending"], "WALL_GONE")
-        self.assertEqual(p["trigger"]["wall_level_usdt"], 0)
+        self.assertEqual(p["shadow"]["reason"], "WALL_GONE")
+        self.assertEqual(p["shadow"]["trigger"]["wall_level_usdt"], 0)
 
     def test_fill_trade_beyond_wall_does_not_stop_but_next_one_does(self):
         e, s = engine()
@@ -463,7 +528,7 @@ class SuiCase(unittest.TestCase):
         p = e.pos[self.SUI]
         self.assertEqual(p["exit_pending"], "")
         e.on_trade(self.SUI, T_OUT + 8.1, 0.6552, 10, False, xt=1_008_100)    # next trade strictly beyond
-        self.assertEqual(p["exit_pending"], "WALL_BROKEN")
+        self.assertEqual((p["shadow"]["reason"], p["exit_pending"]), ("WALL_BROKEN", ""))
 
 
 class Sessions(unittest.TestCase):
@@ -484,9 +549,11 @@ class Sessions(unittest.TestCase):
             filled_long(e, t0)
             e.on_depth(SYM, t0 + 4, *book(100.00))
             e.on_trade(SYM, t0 + 4.1, 99.95, 1, True)
-            for typ in ("BJ_ORDER", "BJ_FILL", "BJ_EXIT"):
+            e.on_trade(SYM, t0 + 4.2, 99.50, 1, True)
+            e.on_trade(SYM, t0 + 4.3, 99.50, 1, True)
+            for typ in ("BJ_ORDER", "BJ_FILL", "BJ_WALL_EXIT_SHADOW", "BJ_EXIT"):
                 self.assertEqual(s.last(typ)["session"], tag)
-            self.assertEqual(s.trades[-1][-1], tag)
+            self.assertEqual(s.trades[-1][21], tag)
             e.on_timer(t0 + 400)
             self.assertEqual(s.walls[0]["session"], tag)
             self.assertEqual(e.day(t0)["s"][tag]["trades"], 1)
@@ -543,41 +610,22 @@ class KillSwitch(unittest.TestCase):
     def lose(self, e, t):
         e.walls.clear()
         filled_long(e, t)
-        e.on_depth(SYM, t + 4, *book(100.00))
-        e.on_trade(SYM, t + 4.1, 99.96, 1, True)
+        e.on_trade(SYM, t + 4, 98.00, 1, True)              # hard stop
+        e.on_trade(SYM, t + 4.1, 98.00, 1, True)            # filled at 98.00: -1.98 x 2.5 = about -5% of the book
 
-    def test_five_losses_in_a_row(self):
+    def test_no_pause_on_losses(self):
+        """No pause after losses in a row or a big daily loss: only a stale feed pauses."""
         e, s = engine()
-        for i in range(5):
+        for i in range(7):
             self.lose(e, T_OUT + i * 100)
-        self.assertEqual(s.last("BJ_KILL")["state"], "paused")
-        self.assertFalse(e.can_enter(T_OUT + 600))
-        e.walls.clear()
-        place_long(e, T_OUT + 600)
-        self.assertNotIn(SYM, e.orders)
-        e.on_timer(T_OUT + 400 + 6 * 3600 + 5)
-        self.assertEqual(s.last("BJ_KILL")["state"], "resumed")
-        self.assertTrue(e.can_enter(T_OUT + 400 + 6 * 3600 + 6))
-
-    def test_win_resets_streak(self):
-        e, s = engine()
-        for i in range(4):
-            self.lose(e, T_OUT + i * 100)
-        e.walls.clear()
-        filled_long(e, T_OUT + 500)
-        e.on_trade(SYM, T_OUT + 505, 100.50, 1, False)      # breakeven, trail 100.50 - 0.3015 = 100.1985
-        e.on_trade(SYM, T_OUT + 506, 100.19, 1, True)       # stop hit
-        e.on_trade(SYM, T_OUT + 507, 100.19, 1, True)       # exit +0.21 x 3 - fees > 0
-        self.assertGreater(s.last("BJ_EXIT")["net_pnl_usd"], 0)
-        self.assertEqual(e.st["loss_streak"], 0)
+        self.assertEqual(s.names().count("BJ_EXIT"), 7)
+        self.assertLess(e.day(T_OUT)["pnl"], -0.2 * 100)
         self.assertNotIn("BJ_KILL", s.names())
-
-    def test_day_loss_3pct(self):
-        e, s = engine()
-        filled_long(e)
-        e.on_depth(SYM, T_OUT + 4, *book(100.00))
-        e.on_trade(SYM, T_OUT + 4.1, 98.80, 1, True)        # 3 x -1.18 = -3.54 > 3% of 100
-        self.assertIn("day loss", s.last("BJ_KILL")["reason"])
+        self.assertTrue(e.can_enter(T_OUT + 800))
+        e.walls.clear()
+        self.assertIsNotNone(place_long(e, T_OUT + 800))
+        self.assertNotIn("day_loss_pct", e.c)
+        self.assertNotIn("max_loss_streak", e.c)
 
     def test_kill_closes_open_position(self):
         e, s = engine()
@@ -687,7 +735,9 @@ class Persistence(unittest.TestCase):
         r.trades_file, r.walls_file = os.path.join(d, "trades.csv"), os.path.join(d, "walls.csv")
         r.old_state_file = os.path.join(d, "bookjump_state.json")
         r.c = bj.load_cfg({})
-        r.book_get, r.book_publish = (lambda: store.get("BOOK JUMP")), (lambda s: store.__setitem__("BOOK JUMP", s))
+        r.cleared, r.st_a = [], None
+        r.book_get = lambda name="BOOK JUMP": store.get(name)
+        r.book_publish = lambda snap, name="BOOK JUMP": store.__setitem__(name, snap)
         return r
 
     def check_header(self, first_line):
@@ -702,7 +752,7 @@ class Persistence(unittest.TestCase):
             r.ensure_trades_header()                         # idempotent over restarts
             with open(r.trades_file, newline="") as fh:
                 got = fh.readlines()
-            self.assertEqual(got[0], self.HEAD + ",session\r\n")
+            self.assertEqual(got[0], self.HEAD + ",session,shadow_exit_pnl\r\n")
             self.assertEqual(got[1:], rows)                   # rows kept byte for byte
 
     def test_header_added_once(self):
@@ -710,6 +760,9 @@ class Persistence(unittest.TestCase):
 
     def test_header_duplicate_repaired(self):
         self.check_header(self.HEAD + ",session,session\r\n")
+
+    def test_header_from_session_only(self):            # the header written by the version deployed on 22 Nov
+        self.check_header(self.HEAD + ",session\r\n")
 
     def test_header_with_lf_endings(self):
         import tempfile
@@ -719,7 +772,7 @@ class Persistence(unittest.TestCase):
                 fh.write(self.HEAD + ",session,session\nrow\n")
             r.ensure_trades_header()
             with open(r.trades_file, newline="") as fh:
-                self.assertEqual(fh.read(), self.HEAD + ",session\nrow\n")
+                self.assertEqual(fh.read(), self.HEAD + ",session,shadow_exit_pnl\nrow\n")
 
     def test_book_round_trip_through_state(self):
         import tempfile
@@ -740,6 +793,17 @@ class Persistence(unittest.TestCase):
             st2 = r2.load_state()
             self.assertEqual((st2["balance"], st2["trades"], list(st2["positions"])), (101.25, 4, [SYM]))
             self.assertEqual(st2["day"]["2026-11-22"]["pnl"], 1.25)
+
+    def test_old_loss_pause_cleared_at_start(self):
+        import tempfile
+        import time as _t
+        store = {"BOOK JUMP": dict(bj.new_state(100), paused_until=_t.time() + 3600, loss_streak=5)}
+        with tempfile.TemporaryDirectory() as d:
+            r = self.runner(d, store)
+            st = r.load_state()
+            self.assertEqual(st["paused_until"], 0)
+            self.assertNotIn("loss_streak", st)
+            self.assertEqual(r.cleared[0][0], "BOOK JUMP")
 
     def test_migrates_old_state_file(self):
         import tempfile
@@ -775,7 +839,7 @@ class RecordedStream(unittest.TestCase):
         self.assertEqual(f["price"], 99.98)
         self.assertEqual((x["reason"], x["exit_price"], x["breakeven_reached"]), ("TRAIL_STOP", 99.99, True))
         self.assertAlmostEqual(x["stop"], 100.31 - 100.31 * 0.003)
-        self.assertAlmostEqual(e.st["balance"], 100 + 0.01 * 3.0 - bj.fees_usd(99.98, 99.99, 3.0, e.c), places=5)
+        self.assertAlmostEqual(e.st["balance"], 100 + 0.01 * 2.5 - bj.fees_usd(99.98, 99.99, 2.5, e.c), places=5)
         self.assertEqual(len([m for m in s.msgs if m.startswith("BJ ")]), 2)    # fill + exit to Telegram
 
 
