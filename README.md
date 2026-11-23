@@ -2,24 +2,52 @@
 
 Paper trading bot on Binance USDT-M perpetuals (systemd service `binance-bot`, folder `~/binance-bot`).
 `bot.py` holds the strategies, accounting, Telegram and logging; its docstring describes POC RETURN and the
-other (switched-off) strategies in detail. `bookjump.py` holds the BOOK JUMP and BJ ABSORB strategies.
+other (switched-off) strategies in detail. `rsi1h.py` is the 1H RSI LONG / 1H RSI SHORT strategy.
+`bookjump.py` holds the retired BOOK JUMP and BJ ABSORB strategies (off unless `BJ_ENABLED=1`).
 
 | File | What |
 |---|---|
 | `bot.py` | main bot: POC RETURN (+ RSI / breakout strategies, off in this deployment), books, Telegram, logs |
-| `bookjump.py` | BOOK JUMP and BJ ABSORB order-book wall strategies, paper only, started by `bot.py` when `ENABLE_BOOKJUMP=1` |
+| `rsi1h.py` | 1H RSI LONG / 1H RSI SHORT (port of the Fyers 2H RSI divergence strategy), paper only, `RSI1H_ENABLED=1` (default) |
+| `bookjump.py` | BOOK JUMP and BJ ABSORB (retired 23 Nov 2026), only started with `BJ_ENABLED=1` |
 | `.env` | settings and keys (never committed); see `.env.example` for every setting and its default |
-| `trades.csv` | every closed trade, all strategies (`strategy` column = book name; `session` and `shadow_exit_pnl` columns for BOOK JUMP / BJ ABSORB) |
+| `trades.csv` | every closed trade, all strategies (`strategy` column = book name; `session` / `shadow_exit_pnl` for the old BOOK JUMP rows; `setup` = 1H RSI divergence detail) |
 | `events.jsonl` | event log (one JSON object per line) |
-| `walls.csv` | every wall seen (incl. BJ ABSORB's absorption result) |
-| `state.json` | bot state; `books` holds every book incl. `BOOK JUMP` and `BJ ABSORB` (balance, start, IST day stats by session, open positions, pause state) |
+| `walls.csv` | BOOK JUMP's walls (kept; no new rows while it is off) |
+| `state.json` | bot state; `books` holds every book (`POC RETURN`, `1H RSI LONG`, `1H RSI SHORT`; the old `BOOK JUMP` / `BJ ABSORB` books stay, unused); `rsi1h` holds the 1H RSI universe size, armed coins and cooldowns |
 
 Run: `venv/bin/python bot.py` (normally via systemd). Checks: `venv/bin/python bot.py --selftest`.
 Tests: `venv/bin/python -m unittest discover -s tests -v` and `venv/bin/python -m pyflakes bot.py bookjump.py tests`.
 
 Telegram commands: `/status /summary /pause /resume /killswitch`.
 
-## BOOK JUMP (order-book penny-jumping, paper only)
+## 1H RSI LONG / 1H RSI SHORT (paper only)
+
+Two $100 paper books next to POC RETURN (`RSI1H_*` settings in `.env.example`; full rules in `rsi1h.py`'s docstring).
+Ported from the Fyers 2H RSI strategy (`fyers_bot/strategy.py` `_div_trigger`), without session or day logic.
+- **Universe / arming** (every hour, ~8 s after each 1H close = :30 past the hour in IST): every TRADING USDT perpetual
+  with 24h quote volume >= $500k (independent of `MIN_TURNOVER_USD`, which stays POC's). Closed 1H RSI(14) > 70 arms
+  SHORT, < 30 arms LONG; a coin stays armed only while that holds. 1H candles once an hour per symbol (request weight
+  1 each); 5m / 15m candles only for armed symbols; requests pause near Binance's 2400/min weight limit.
+- **SHORT** (5m, ~8 s after each close, 45 min window): reference = the highest RED candle with close > EMA5 and
+  low > EMA5; divergence = the candle just closed: red, higher high, RSI(14, 5m) >= 3 points lower, >= 2 candles
+  between. **LONG** (15m, 120 min): the lowest GREEN candle with high < EMA5; the candle just closed: green, lower
+  low, RSI(14, 15m) >= 3 points higher, >= 2 candles between.
+- **Entry**: at the check (start of the next candle), paper fill at the last trade price, only if it is still below
+  the red divergence candle's open (short) / above the green one's open (long); otherwise `RSI1H_SKIP`.
+  Taker fee `FEE_PCT_PER_SIDE` on both sides; slippage `RSI1H_SLIPPAGE_PCT` (0, like the POC paper fills).
+- **Stop**: 1 tick beyond the divergence candle's high / low, at least 0.5% (widened + `RSI1H_STOP_WIDENED`).
+  **Exit**: no target; stop to entry at 1R, from 3R a whole-R trail 1R behind; checked on 1m candles like POC.
+- **Size**: 5% of the book at the stop, 20x isolated cap, step-rounded; skipped if Binance's min notional can't be
+  met within that. One open trade per book, most extreme 1H RSI first; 30-min cooldown on a coin after a short.
+- **Logs**: events `RSI1H_SCAN` (universe, armed counts, newly armed / dropped), `RSI1H_SIGNAL` (both RSI values and
+  the gap), `RSI1H_SKIP` (reason), `RSI1H_STOP_WIDENED`, then the bot's `ENTRY` (with `setup`) / `EXIT`; trades.csv
+  rows with strategy `1H RSI LONG` / `1H RSI SHORT` and the `setup` column. `/status` shows both books, the universe
+  size and the top armed coins; the day summary (`report`) includes both books.
+
+POC RETURN is unchanged and still trades one position at a time (no new POC order while a POC trade is open).
+
+## BOOK JUMP (retired 23 Nov 2026; `BJ_ENABLED=1` to run it again)
 
 Runs 24/7 next to POC RETURN, in its own threads, with its own book (`state.json` → `books["BOOK JUMP"]`, never
 swept into or used to fund other books): POC is not affected

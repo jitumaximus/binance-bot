@@ -8,6 +8,11 @@ Each book has its own balance (starts at 1/3 of the account), its own sizing, on
 its own daily loss limit and its own results. Two books never hold the same coin at the same time
 (Delta nets positions per contract), so the first one to trigger gets it.
 
+1H RSI LONG / 1H RSI SHORT (RSI1H_ENABLED=1, default; paper mode on Binance only): rsi1h.py - the Fyers 2H RSI
+  divergence strategy on 1H RSI arming, 5m (short) / 15m (long) divergence, two $100 books next to POC RETURN.
+
+BOOK JUMP / BJ ABSORB (bookjump.py): retired 23 Nov 2026; only started with BJ_ENABLED=1 (default 0).
+
 POC RETURN (ENABLE_POC=1, paper mode only - its own book, normally run alone as "bot 2")
   Each US session (09:30-16:00 New York) -> volume profile of its 15m candles -> POC, active until the next
   weekday session closes (Friday's POC runs through the weekend until Monday 16:00 NY).
@@ -101,6 +106,7 @@ from zoneinfo import ZoneInfo
 import requests
 
 import bookjump
+import rsi1h
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IST = ZoneInfo("Asia/Kolkata")
@@ -109,7 +115,7 @@ STOCK_TOKEN_RE = re.compile(r"bStocks? Token|xStock Token|ONDO Token|Gold Token|
 PERIOD = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "2h": 7200, "4h": 14400}
 ARM_TF = "2h"            # RSI arming timeframe (was 4h); candles close at even UTC hours
 ARM = ARM_TF.upper()
-BOOKS = (f"{ARM} RSI SHORT", f"{ARM} RSI LONG", "1H BREAKOUT", "1H BREAKDOWN", "POC RETURN")
+BOOKS = (f"{ARM} RSI SHORT", f"{ARM} RSI LONG", "1H BREAKOUT", "1H BREAKDOWN", "POC RETURN") + rsi1h.BOOKS
 RR = 5.0  # fixed reward-to-risk (1:5). Not configurable on purpose.
 log = logging.getLogger("bot")
 
@@ -209,8 +215,10 @@ def make_cfg():
         # short mirror of the 1H breakout (own book); defaults to the breakout switch, so bot 2 (breakout off) stays POC-only
         "enable_breakdown": b("ENABLE_BREAKDOWN", os.getenv("ENABLE_BREAKOUT", "1")),
         "enable_poc": b("ENABLE_POC", "0"),
-        # BOOK JUMP order-book penny-jumping (bookjump.py): paper mode on Binance only, its own book and threads
-        "enable_bookjump": b("ENABLE_BOOKJUMP", "0"),
+        # BOOK JUMP / BJ ABSORB (bookjump.py): retired 23 Nov 2026, kept behind BJ_ENABLED (ENABLE_BOOKJUMP is ignored)
+        "enable_bookjump": b("BJ_ENABLED", "0"),
+        # 1H RSI LONG / 1H RSI SHORT (rsi1h.py): paper mode on Binance only; settings RSI1H_* read by rsi1h.load_cfg
+        "enable_rsi1h": b("RSI1H_ENABLED", "1"),
         "poc_away_pct": f("POC_AWAY_PCT", 2.0),            # top coins (POC_MAJORS)
         "poc_away_other_pct": f("POC_AWAY_OTHER_PCT", 5.0),  # every other coin (stock/ETF tokens use 2%)
         "poc_majors": lst("POC_MAJORS") or [x + ("USDT" if exchange == "binance" else "USD") for x in
@@ -499,6 +507,8 @@ def session_phase(cfg, ts):
 def book_for(side, strategy):
     if strategy == "poc":
         return "POC RETURN"
+    if strategy == "rsi1h":
+        return f"1H RSI {side.upper()}"
     if strategy == "breakdown":
         return "1H BREAKDOWN"
     return "1H BREAKOUT" if strategy == "breakout" else f"{ARM} RSI {side.upper()}"
@@ -748,6 +758,10 @@ class Binance:
                 last = f"rate limited ({r.status_code})"
                 time.sleep(min(fnum(r.headers.get("Retry-After"), 5), 30))
                 continue
+            used = fnum(r.headers.get("X-MBX-USED-WEIGHT-1M"), 0)
+            if used >= 2000:                       # limit 2400/min per IP: wait for the next minute window
+                log.warning("Binance request weight %d/2400 this minute: pausing until the next minute", used)
+                time.sleep(61 - time.time() % 60)
             try:
                 data = r.json()
             except ValueError:
@@ -1003,7 +1017,14 @@ class Bot:
         self.last_equity, self.last_equity_ts = 0.0, 0
         self.last_protect_check = 0
         self.last_ob_warn = 0
-        self.bj = None                       # BOOK JUMP runner (bookjump.py) when ENABLE_BOOKJUMP=1
+        self.bj = None                       # BOOK JUMP runner (bookjump.py) when BJ_ENABLED=1
+        self.rsi1h, self.rsi1h_refused = None, ""   # 1H RSI books (rsi1h.py)
+        if cfg.get("enable_rsi1h"):
+            self.rsi1h_refused = rsi1h.refuse_reason(cfg)
+            if self.rsi1h_refused:
+                cfg["enable_rsi1h"] = False
+            else:
+                self.rsi1h = rsi1h.Rsi1h(self)
         self.migrate_trades_header()
 
     def migrate_trades_header(self):
@@ -1138,7 +1159,7 @@ class Bot:
     def enabled_books(self):
         c = self.cfg
         return [n for n, on in zip(BOOKS, (c["enable_short"], c["enable_long"], c["enable_breakout"], c["enable_breakdown"],
-                                         c["enable_poc"])) if on]
+                                         c["enable_poc"], c.get("enable_rsi1h"), c.get("enable_rsi1h"))) if on]
 
     def book_names(self):
         on = self.enabled_books()
@@ -1855,6 +1876,8 @@ class Bot:
             f"{ARM} RSI LONG (RSI<{c['rsi_long_level']:g}, 15m confirmation)" if c["enable_long"] else "",
             f"1H BREAKOUT ({c['consol_candles']} hourly candles within {c['range_pct']:g}%, 15m check at minute "
             f"{c['check_minute']})" if c["enable_breakout"] else "",
+            "1H RSI LONG / 1H RSI SHORT (1H RSI arming, 5m/15m RSI divergence, BE 1R, trail from 3R)"
+            if c.get("enable_rsi1h") else "",
             f"POC RETURN (prev. US-session POC, {c['poc_away_pct']:g}% away (top {len(c['poc_majors'])} coins + stock/ETF/gold/silver tokens) / "
             f"{c['poc_away_other_pct']:g}% (others) then first touch, active until the next "
             f"session close; stop 0.25% then beyond the touch candle (min 0.25%); BE 1R, trail from {c['trail_start_r']:g}R"
@@ -2078,8 +2101,20 @@ class Bot:
                    take_profit=t["tp"], contracts=t["contracts"], risk_usd=round(t["risk_usd"], 2),
                    notional_usd=round(t["notional"], 2), rsi_4h=t["rsi"], stop_source=t.get("stop_source"),
                    leverage=t.get("leverage"), margin_usd=round(t.get("margin", 0.0), 2),
-                   orderbook=t.get("ob"))
+                   orderbook=t.get("ob"), **({"setup": t["extra"].get("detail")} if t.get("strategy") == "rsi1h" else {}))
         fmt = lambda x: fmt_price(x, t["tick"])  # noqa: E731
+        if t.get("strategy") == "rsi1h":
+            x = t["extra"]
+            self.tg.send(
+                f"{tside(t).upper()} ENTERED [{bk}] [{c['mode']}]\n{t['symbol']}\n"
+                f"Entry: {fmt(t['entry'])} (market; last price {x['last_price']:g})\n"
+                f"Stop-loss: {fmt(t['stop'])} ({'widened to ' + format(self.rsi1h.c['min_stop_pct'], 'g') + '%' if x['stop_widened'] else '1 tick beyond the divergence candle'})\n"
+                f"Target: none - stop to entry at {t['be_r']:g}R, then trailing in whole R from {t['trail_start_r']:g}R\n"
+                f"Size: {t['contracts'] * t['cv']:g} (~${t['notional']:.0f} notional), {t['leverage']:g}x isolated, "
+                f"margin ${t['margin']:.2f}\n"
+                f"Risk: ${t['risk_usd']:.2f} ({t['risk_usd'] / eq * 100:.2f}% of {bk}'s ${eq:.2f})\n"
+                f"1H RSI {t['rsi']} | {x['detail']}\nNo real order placed (paper mode).")
+            return
         stop_label = (f"{c['margin_stop_pct']:g}%-of-margin stop" if t.get("stop_source") == "margin"
                       else f"{c['poc_min_stop_pct']:g}% initial stop" if t.get("trail") else "candle stop")
         self.tg.send(
@@ -2148,9 +2183,9 @@ class Bot:
             if t.get("trail") and risk0(t) > 0:
                 fav = (t["entry"] - cd["low"]) if short else (cd["high"] - t["entry"])
                 r = int(math.floor(fav / risk0(t) + 1e-9))
-                if r >= self.cfg["trail_start_r"] and r > t.get("trail_r", 0):
+                if r >= t.get("trail_start_r", self.cfg["trail_start_r"]) and r > t.get("trail_r", 0):
                     self.apply_trail(t, r)
-            be_r = self.cfg["be_trigger_r"]
+            be_r = t.get("be_r", self.cfg["be_trigger_r"])
             if allow_be and be_r > 0 and not t.get("be_moved") and risk0(t) > 0:
                 fav = (t["entry"] - cd["low"]) if short else (cd["high"] - t["entry"])
                 if fav >= be_r * risk0(t):
@@ -2402,6 +2437,9 @@ class Bot:
     def close_trade(self, t, res):
         c = self.cfg
         exit_px = res["price"]
+        if t.get("strategy") == "rsi1h" and self.rsi1h:
+            exit_px = self.rsi1h.exit_price(t, exit_px)            # RSI1H_SLIPPAGE_PCT against us (0 = none)
+            self.rsi1h.on_close(t, res)                             # 30-min cooldown after a short
         n, cv = t["contracts"], t["cv"]
         direction = 1 if tside(t) == "long" else -1
         gross = n * cv * (exit_px - t["entry"]) * direction
@@ -2439,7 +2477,8 @@ class Bot:
                         fmt(t["entry"]), fmt(t["stop"]), fmt(t["tp"]) if t.get("tp") else "trail", fmt(exit_px), res["reason"],
                         round(gross, 4), round(fees, 4), round(net, 4), round(self.inr(net), 2),
                         round(r_mult, 2), "" if t.get("rsi") is None else t.get("rsi"), res["estimated"],
-                        (t.get("ob") or {}).get("ratio", ""), bk, round(book["balance"], 4)])
+                        (t.get("ob") or {}).get("ratio", ""), bk, round(book["balance"], 4)]
+                       + (["", "", (t.get("extra") or {}).get("detail", "")] if t.get("strategy") == "rsi1h" else []))
         d = book["day"].get(dk, {})
         m = book["month"].get(mk, {})
         bal_line = (f"{bk} balance: ${book['balance']:.2f} (Rs {self.inr(book['balance']):,.0f})"
@@ -2497,6 +2536,8 @@ class Bot:
         lines.append(f"Breakout ranges armed this hour: {len(bo)}")
         top = sorted(bo.items(), key=lambda kv: kv[1]["band_pct"])[:5]
         lines += [f"  {s} range high {v['range_high']} ({v['band_pct']}%)" for s, v in top]
+        if self.rsi1h:
+            lines += [""] + self.rsi1h.status_lines()
         if self.bj:
             lines += ["", self.bj.status_text()]
         return "\n".join(x for x in lines if x is not None)
@@ -2641,6 +2682,9 @@ class Bot:
         eq = self.equity_usd()
         if eq <= 0:
             sys.exit("Could not determine account equity (zero balance?). Set TRADING_CAPITAL_USD in .env or fund the account.")
+        if self.rsi1h:
+            self.rsi1h.ensure_books()                    # $100 each, before init_books (which would fund from POC)
+            self.rsi1h.ensure_trades_header()
         self.init_books()
         if not c["dry_run"]:
             try:
@@ -2651,6 +2695,13 @@ class Bot:
             except Exception as ex:  # noqa: BLE001
                 log.warning("position reconciliation skipped: %s", ex)
         bj_line = self.bookjump_setup()
+        if self.rsi1h:
+            bj_line += self.rsi1h.startup_line()
+        elif self.rsi1h_refused:
+            bj_line += f"\n1H RSI books: NOT started - paper mode on Binance only ({self.rsi1h_refused})."
+        if os.environ.get("ENABLE_BOOKJUMP", "").strip() == "1" and not c["enable_bookjump"]:
+            log.info("ENABLE_BOOKJUMP=1 in .env is ignored: BOOK JUMP is retired (BJ_ENABLED=1 would start it)")
+        log.info("Books running: %s", ", ".join(self.enabled_books()))
         self.tg.send(
             f"Bot started [{c['mode']}]\n{len(prods)} instruments, account ${eq:.2f} (Rs {self.inr(eq):.0f})\n"
             + "\n".join(f"  {n}: ${self.book(n)['balance']:.2f}" for n in self.book_names()) + bj_line + "\n"
@@ -2688,6 +2739,11 @@ class Bot:
                 self.tick_poc(now)
             except Exception:  # noqa: BLE001
                 log.exception("POC tick failed")
+        if self.rsi1h:
+            try:
+                self.rsi1h.tick(now)
+            except Exception:  # noqa: BLE001
+                log.exception("1H RSI tick failed")
         if now - getattr(self, "_last_manage", 0) >= self.cfg["manage_interval"]:
             self._last_manage = now
             self.manage_open_trades(now)
