@@ -725,6 +725,18 @@ class Files(unittest.TestCase):
             self.assertEqual((rows[0], len(rows)), (bj.WALL_COLS, 2))
 
 
+class StartGrace(unittest.TestCase):
+    def test_start_resets_the_stale_clock(self):
+        import threading
+        from unittest import mock
+        r = bj.BookJump.__new__(bj.BookJump)
+        r.lock, r.subs = threading.RLock(), set()
+        r.last_msg = {"depth": 1.0, "trade": 1.0}           # set by prepare(), long before the sockets open
+        with mock.patch("threading.Thread"):
+            r.start()
+        self.assertGreater(min(r.last_msg.values()), 1e9)
+
+
 class Persistence(unittest.TestCase):
     HEAD = ("open_time_ist,close_time_ist,mode,symbol,side,contracts,entry,stop_loss,take_profit,exit_price,"
             "exit_reason,gross_pnl_usd,est_fees_usd,net_pnl_usd,net_pnl_inr,r_multiple,rsi_4h,exit_estimated,"

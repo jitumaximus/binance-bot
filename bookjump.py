@@ -1178,6 +1178,9 @@ class BookJump:
                 f"{a['away_ticks']:g} ticks | max {a['max_open']} open, risk {a['risk_pct']:g}% | same exits")
 
     def start(self):
+        with self.lock:                                         # the bot's start-up runs between prepare() and here:
+            now = time.time()                                   # time the feed starts counting from the sockets
+            self.last_msg = {"depth": now, "trade": now}
         for kind in ("depth", "trade"):
             threading.Thread(target=self.ws_loop, args=(kind,), name=f"bj-ws-{kind}", daemon=True).start()
         threading.Thread(target=self.timer_loop, name="bj-timer", daemon=True).start()
