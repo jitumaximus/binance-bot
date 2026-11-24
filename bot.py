@@ -14,6 +14,7 @@ its own daily loss limit and its own results. Two books never hold the same coin
 BOOK JUMP / BJ ABSORB (bookjump.py): retired 23 Nov 2026; only started with BJ_ENABLED=1 (default 0).
 
 POC RETURN (ENABLE_POC=1, paper mode only - its own book, normally run alone as "bot 2")
+  POC_ENABLED=0 pauses it (no new orders or trades; book, state and logs kept; shown as "paused").
   Each US session (09:30-16:00 New York) -> volume profile of its 15m candles -> POC, active until the next
   weekday session closes (Friday's POC runs through the weekend until Monday 16:00 NY).
   LONG : price first trades >= POC_AWAY_PCT (2%, POC_MAJORS = top 10 coins, plus tokenised stocks/ETFs and gold/silver)
@@ -215,6 +216,9 @@ def make_cfg():
         # short mirror of the 1H breakout (own book); defaults to the breakout switch, so bot 2 (breakout off) stays POC-only
         "enable_breakdown": b("ENABLE_BREAKDOWN", os.getenv("ENABLE_BREAKOUT", "1")),
         "enable_poc": b("ENABLE_POC", "0"),
+        # POC_ENABLED=0 pauses the POC RETURN book: no new levels, orders or trades; its balance, history and any
+        # open trade are kept (an open trade is still managed to its exit). Unset / 1 = running.
+        "poc_paused": os.getenv("POC_ENABLED", "1").strip() == "0",
         # BOOK JUMP / BJ ABSORB (bookjump.py): retired 23 Nov 2026, kept behind BJ_ENABLED (ENABLE_BOOKJUMP is ignored)
         "enable_bookjump": b("BJ_ENABLED", "0"),
         # 1H RSI LONG / 1H RSI SHORT (rsi1h.py): paper mode on Binance only; settings RSI1H_* read by rsi1h.load_cfg
@@ -1161,6 +1165,9 @@ class Bot:
         return [n for n, on in zip(BOOKS, (c["enable_short"], c["enable_long"], c["enable_breakout"], c["enable_breakdown"],
                                          c["enable_poc"], c.get("enable_rsi1h"), c.get("enable_rsi1h"))) if on]
 
+    def paused_books(self):
+        return ["POC RETURN"] if self.cfg["enable_poc"] and self.cfg["poc_paused"] else []
+
     def book_names(self):
         on = self.enabled_books()
         return [n for n in BOOKS if n in self.state["books"] and
@@ -1633,6 +1640,15 @@ class Bot:
         """Top coins and tokenised stocks / ETFs use the 2% rule; every other coin 5%."""
         return sym in self.cfg["poc_majors"] or bool(prods.get(sym, {}).get("stock_token"))
 
+    def poc_pause_step(self, now):
+        """POC_ENABLED=0: cancel a resting POC order (if any) and do nothing else. An open POC trade is
+        managed by manage_open_trades like every other book."""
+        pend = self.state.get("poc_pending")
+        if pend:
+            lv = (self.state.get("poc") or {}).get("levels", {}).get(pend["symbol"])
+            if self.poc_cancel(pend, "POC RETURN paused (POC_ENABLED=0)", None, lv, now):
+                self.save_state()
+
     def tick_poc(self, now):
         c = self.cfg
         made = self.last_us_close(now)
@@ -1883,6 +1899,7 @@ class Bot:
             f"session close; stop 0.25% then beyond the touch candle (min 0.25%); BE 1R, trail from {c['trail_start_r']:g}R"
             + ("; NO entries during the US session (Mon-Fri 09:30-16:00 NY): only after hours and weekends"
                if c["poc_skip_us_session"] else "") + ")"
+            + (" - PAUSED (POC_ENABLED=0): no new orders or trades" if c["poc_paused"] else "")
             if c["enable_poc"] else ""] if x) + f"\n{sess}"
 
     def try_enter(self, sig, now):
@@ -2509,7 +2526,8 @@ class Bot:
             b = self.book(n)
             d = b["day"].get(dk, {})
             t = b["open_trade"]
-            lines.append(f"\n{n}{'' if n in self.enabled_books() else ' (off)'}: ${b['balance']:.2f} "
+            tag = (" (paused)" if n in self.paused_books() else "") if n in self.enabled_books() else " (off)"
+            lines.append(f"\n{n}{tag}: ${b['balance']:.2f} "
                          f"(start ${b['start']:.2f}) | today {d.get('trades', 0)} trades, ${d.get('pnl', 0):+.2f}")
             lines.append(f"  {tside(t).upper()} {t['symbol']} x{t['contracts']} entry {fmt_price(t['entry'], t['tick'])} "
                          f"SL {fmt_price(t['stop'], t['tick'])}{' (at entry)' if t.get('be_moved') else ''} "
@@ -2524,7 +2542,9 @@ class Bot:
         top = sorted(armed_l.items(), key=lambda kv: kv[1]["rsi"])[:5]
         lines += [f"  {s} RSI {v['rsi']}" for s, v in top]
         pc = st.get("poc") or {}
-        if self.cfg["enable_poc"]:
+        if self.cfg["enable_poc"] and self.cfg["poc_paused"]:
+            lines.append("POC RETURN: paused (POC_ENABLED=0) - no new orders or trades")
+        elif self.cfg["enable_poc"]:
             lv = pc.get("levels", {})
             lines.append(f"POC levels: {len(lv)} (US session ending {ist(pc['made']) if pc.get('made') else '-'}) | "
                          f"armed long {sum(x['armed_long'] for x in lv.values())}, "
@@ -2686,6 +2706,8 @@ class Bot:
             self.rsi1h.ensure_books()                    # $100 each, before init_books (which would fund from POC)
             self.rsi1h.ensure_trades_header()
         self.init_books()
+        self.state["paused_books"] = self.paused_books()        # read by mintoro-api (dashboard shows "paused")
+        self.save_state()
         if not c["dry_run"]:
             try:
                 held = {t["product_id"] for _, t in self.open_trades()}
@@ -2701,10 +2723,12 @@ class Bot:
             bj_line += f"\n1H RSI books: NOT started - paper mode on Binance only ({self.rsi1h_refused})."
         if os.environ.get("ENABLE_BOOKJUMP", "").strip() == "1" and not c["enable_bookjump"]:
             log.info("ENABLE_BOOKJUMP=1 in .env is ignored: BOOK JUMP is retired (BJ_ENABLED=1 would start it)")
-        log.info("Books running: %s", ", ".join(self.enabled_books()))
+        log.info("Books running: %s%s", ", ".join(self.enabled_books()),
+                 f" (paused: {', '.join(self.paused_books())})" if self.paused_books() else "")
         self.tg.send(
             f"Bot started [{c['mode']}]\n{len(prods)} instruments, account ${eq:.2f} (Rs {self.inr(eq):.0f})\n"
-            + "\n".join(f"  {n}: ${self.book(n)['balance']:.2f}" for n in self.book_names()) + bj_line + "\n"
+            + "\n".join(f"  {n}: ${self.book(n)['balance']:.2f}" + (" (paused)" if n in self.paused_books() else "")
+                        for n in self.book_names()) + bj_line + "\n"
             + self.strategy_desc() + "\nOne position at a time per strategy; a coin is held by one strategy at most"
             + (f" | stop to entry at +{c['be_trigger_r']:g}R" if c["be_trigger_r"] > 0 else "")
             + (f" | order book {c['ob_min_ratio']:g}x within {c['ob_depth_pct']:g}%" if c["ob_filter"] else "") + "\n"
@@ -2736,7 +2760,10 @@ class Bot:
             self.tick_breakout(now)
         if self.cfg["enable_poc"]:
             try:
-                self.tick_poc(now)
+                if self.cfg["poc_paused"]:
+                    self.poc_pause_step(now)
+                else:
+                    self.tick_poc(now)
             except Exception:  # noqa: BLE001
                 log.exception("POC tick failed")
         if self.rsi1h:

@@ -21,7 +21,7 @@ POC_BASELINE = "1536659"
 HOOKS = {"make_cfg", "book_for", "Bot.__init__", "Bot.enabled_books", "Bot.check_exit_by_candles",
          "Bot.finish_entry", "Bot.close_trade", "Bot.status_text", "Bot.strategy_desc", "Bot.startup", "Bot.tick",
          "Binance.request"}
-ADDED = set()
+ADDED = {"Bot.paused_books", "Bot.poc_pause_step"}          # POC_ENABLED=0 pause (24 Nov 2026)
 POC_FUNCS = ("Bot.tick_poc", "Bot.poc_pending_step", "Bot.poc_filled", "Bot.poc_place_limit", "Bot.poc_cancel",
              "Bot.poc_take_at_poc", "Bot.build_pocs", "Bot.poc_tier1", "Bot.manage_poc_live", "Bot.touch_stop_price",
              "Bot.set_touch_stop", "Bot.apply_trail", "Bot.apply_be", "Bot.try_enter", "Bot.entry_allowed",
@@ -30,7 +30,7 @@ POC_FUNCS = ("Bot.tick_poc", "Bot.poc_pending_step", "Bot.poc_filled", "Bot.poc_
 ENV = {"EXCHANGE": "binance", "DRY_RUN": "1", "ENABLE_POC": "1", "ENABLE_SHORT": "0", "ENABLE_LONG": "0",
        "ENABLE_BREAKOUT": "0", "POC_SKIP_US_SESSION": "1", "START_CAPITAL_INR": "11890", "USD_INR_RATE": "85",
        "RSI1H_ENABLED": "0"}
-CLEAR = ("ENABLE_BOOKJUMP", "BJ_ENABLED")
+CLEAR = ("ENABLE_BOOKJUMP", "BJ_ENABLED", "POC_ENABLED")
 PROD = {"id": 1, "symbol": "BTCUSDT", "tick": 0.1, "cv": 0.001, "type": "perpetual_futures", "stock_token": False}
 
 
@@ -132,6 +132,7 @@ class PocUnchanged(unittest.TestCase):
     def test_config_identical_apart_from_new_switch(self):
         old, new = self.old.make_cfg(), self.new.make_cfg()
         self.assertEqual(new.pop("enable_rsi1h"), False)
+        self.assertEqual(new.pop("poc_paused"), False)              # POC_ENABLED unset = running
         old.pop("data_dir"), new.pop("data_dir")
         self.assertEqual(old, new)
 
@@ -288,6 +289,78 @@ class PocUnchanged(unittest.TestCase):
         b.tick_poc(now + 10)
         self.assertEqual((b.state.get("poc_pending") or {}).get("symbol"), "BTCUSDT")
         self.assertIn("POC_ORDER", events)
+
+    # ---- 5. POC_ENABLED=0 pauses the book ----
+    def paused_bot(self):
+        os.environ["POC_ENABLED"] = "0"
+        try:
+            b, sent = self.make(self.new, tempfile.mkdtemp(dir=self.tmp), FakeData())
+        finally:
+            os.environ.pop("POC_ENABLED", None)
+        return b, sent
+
+    def test_pause_flag_values(self):
+        for v, paused in (("0", True), ("1", False), ("", False), (None, False)):
+            if v is None:
+                os.environ.pop("POC_ENABLED", None)
+            else:
+                os.environ["POC_ENABLED"] = v
+            try:
+                self.assertEqual(self.new.make_cfg()["poc_paused"], paused, repr(v))
+            finally:
+                os.environ.pop("POC_ENABLED", None)
+
+    def test_paused_no_orders_shown_paused_book_kept(self):
+        import time as _t
+        b, sent = self.paused_bot()
+        b.startup()
+        self.assertEqual(b.state["paused_books"], ["POC RETURN"])
+        with open(os.path.join(b.cfg["data_dir"], "state.json")) as fh:
+            self.assertIn('"paused_books"', fh.read())
+        start = next(m for m in sent if m.startswith("Bot started"))
+        self.assertRegex(start, r"POC RETURN: \$[0-9.]+ \(paused\)")
+        self.assertIn("PAUSED (POC_ENABLED=0)", start)
+        self.assertIn("POC RETURN", b.enabled_books())                 # still a book (balance kept), not "off"
+        bal = b.book("POC RETURN")["balance"]
+        now = _t.time()
+        b.state["poc"] = {"made": b.last_us_close(now), "tiered": 2, "levels": {"BTCUSDT": {
+            "poc": 100.0, "product_id": 1, "armed_long": True, "armed_short": False}}}
+        b.in_us_session = lambda now: False
+        b.data.tickers = lambda ct: [{"symbol": "BTCUSDT", "mark_price": 100.05}]      # would place an order
+        events = []
+        b.event = lambda typ, **kw: events.append(typ)
+        b.manage_open_trades = lambda now: None
+        b.session_tasks = lambda now: None
+        b.handle_telegram = lambda: None
+        b._poc_poll = 0
+        for k in range(5):
+            b.tick(now + 10 * k)
+        self.assertIsNone(b.state.get("poc_pending"))
+        self.assertEqual([e for e in events if e.startswith("POC")], [])
+        self.assertIsNone(b.book("POC RETURN")["open_trade"])
+        self.assertEqual(b.book("POC RETURN")["balance"], bal)
+        st = b.status_text()
+        self.assertIn("POC RETURN (paused): $", st)
+        self.assertIn("POC RETURN: paused (POC_ENABLED=0)", st)
+        self.assertNotIn("POC levels:", st)
+
+    def test_paused_cancels_a_resting_order(self):
+        import time as _t
+        b, _ = self.paused_bot()
+        b.startup()
+        events = []
+        b.event = lambda typ, **kw: events.append((typ, kw))
+        b.state["poc_pending"] = {"symbol": "BTCUSDT", "side": "long", "product_id": 1, "price": 100.0,
+                                  "placed": int(_t.time()), "trade": {}}
+        b.poc_pause_step(_t.time())
+        self.assertIsNone(b.state["poc_pending"])
+        self.assertEqual(events[0][0], "POC_ORDER_CANCELLED")
+        self.assertIn("paused", events[0][1]["reason"])
+
+    def test_running_state_says_nothing_paused(self):
+        (_, _), (bn, _) = self.bots()
+        bn.startup()
+        self.assertEqual(bn.state["paused_books"], [])
 
 
 if __name__ == "__main__":
