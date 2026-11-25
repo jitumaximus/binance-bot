@@ -26,12 +26,15 @@ HOOKS = {"make_cfg", "book_for", "Bot.__init__", "Bot.enabled_books", "Bot.check
          "Bot.try_enter", "Bot.enter_live", "Binance.orderbook", "Binance.place_order",
          # 1H RSI limit exits (26 Nov 2026): 1H RSI paper trades go to manage_rsi1h_paper (POC trades unchanged);
          # no extra slippage on a simulated limit exit; manual / session close sends a pending exit's rest at market
-         "Bot.manage_open_trades", "Bot.close_now"}
+         "Bot.manage_open_trades", "Bot.close_now",
+         # parallel 1H RSI trades (26 Nov 2026): open_trades also lists a book's more_trades (POC never has any)
+         "Bot.open_trades"}
 ADDED = {"Bot.paused_books", "Bot.poc_pause_step",          # POC_ENABLED=0 pause (24 Nov 2026)
          "Bot.capped_entry", "Bot.exit_exec", "BinanceLiveVenue.__init__", "BinanceLiveVenue.book",
          "BinanceLiveVenue.ioc",                            # entry execution (25 Nov 2026)
          "Bot.manage_rsi1h_paper", "Bot.start_limit_exit", "Bot.step_limit_exit",
-         "Bot.finish_limit_exit"}                           # 1H RSI limit exits (26 Nov 2026)
+         "Bot.finish_limit_exit",                           # 1H RSI limit exits (26 Nov 2026)
+         "Bot.book_trades", "Bot.free_margin", "Bot.add_trade", "Bot.drop_trade"}   # parallel 1H RSI trades
 POC_FUNCS = ("Bot.tick_poc", "Bot.poc_pending_step", "Bot.poc_filled", "Bot.poc_place_limit", "Bot.poc_cancel",
              "Bot.poc_take_at_poc", "Bot.build_pocs", "Bot.poc_tier1", "Bot.manage_poc_live", "Bot.touch_stop_price",
              "Bot.set_touch_stop", "Bot.apply_trail", "Bot.apply_be", "Bot.entry_allowed",
@@ -143,7 +146,7 @@ class PocUnchanged(unittest.TestCase):
         old, new = self.old.make_cfg(), self.new.make_cfg()
         self.assertEqual(new.pop("enable_rsi1h"), False)
         self.assertEqual(new.pop("poc_paused"), False)              # POC_ENABLED unset = running
-        for k, v in (("entry_slip_cap_pct", 0.001), ("liq_cap_pct", 0.2), ("entry_max_children", 20),
+        for k, v in (("entry_slip_cap_pct", 0.001), ("liq_cap_pct", 0.3), ("entry_max_children", 20),
                      ("exit_slip_cap_pct", 0.001), ("exit_guard_r", 0.5), ("exit_max_children", 20)):
             self.assertEqual(new.pop(k), v)                         # entry execution (25 Nov 2026)
         old.pop("data_dir"), new.pop("data_dir")
