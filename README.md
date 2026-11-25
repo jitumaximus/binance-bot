@@ -14,6 +14,7 @@ other (switched-off) strategies in detail. `rsi1h.py` is the 1H RSI LONG / 1H RS
 | `trades.csv` | every closed trade, all strategies (`strategy` column = book name; `session` / `shadow_exit_pnl` for the old BOOK JUMP rows; `setup` = 1H RSI divergence detail) |
 | `events.jsonl` | event log (one JSON object per line) |
 | `walls.csv` | BOOK JUMP's walls (kept; no new rows while it is off) |
+| `candidates.csv` | every 1H RSI divergence signal at each 5m / 15m check, taken or not: rank, reason if not taken (ranked lower, book busy, cooldown, entry check, size, ...), arming RSI, reference and divergence candle (time, high/low, RSI), RSI gap, entry check vs the divergence candle's open, candle stop, stop used, stop %, size. Same columns as the fyers-bot's `data/candidates.csv` (since 25 Nov 2026; no extra API calls, so there are no rows while a book is busy) |
 | `state.json` | bot state; `books` holds every book (`POC RETURN`, `1H RSI LONG`, `1H RSI SHORT`; the old `BOOK JUMP` / `BJ ABSORB` books stay, unused); `rsi1h` holds the 1H RSI universe size, armed coins and cooldowns |
 
 Run: `venv/bin/python bot.py` (normally via systemd). Checks: `venv/bin/python bot.py --selftest`.

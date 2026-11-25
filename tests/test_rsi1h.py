@@ -389,3 +389,55 @@ class Runner(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Candidates(Runner):
+    """candidates.csv: one row per divergence signal per check, taken or not, same columns as the fyers-bot's."""
+    def rows(self):
+        with open(os.path.join(self.d, "candidates.csv"), newline="") as fh:
+            r = list(csv.DictReader(fh))
+        self.assertEqual(list(r[0].keys()), R.CAND_COLS)
+        return r
+
+    def test_taken_and_ranked_lower(self):
+        end = T0 + 300
+        cands, sig = find_signal("short", 300, 45, end)
+        self.arm("short", [("AUSDT", 75.0), ("BUSDT", 88.0)])
+        self.fd.c5 = {"AUSDT": cands, "BUSDT": cands}
+        px = round(sig["div_open"] * 0.999, 4)
+        self.fd.px = {"AUSDT": px, "BUSDT": px}
+        n_before = len(self.fd.calls)
+        self.r.tick(end + 8)
+        b, a = self.rows()
+        self.assertEqual((b["symbol"], b["taken"], b["rank"], b["reason"], b["check"]), ("BUSDT", "yes", "1", "", "5m close"))
+        self.assertEqual((a["symbol"], a["taken"], a["rank"], a["reason"]), ("AUSDT", "no", "2", "ranked lower"))
+        t = self.b.book("1H RSI SHORT")["open_trade"]
+        self.assertEqual((b["bot"], b["book"], b["side"], float(b["arm_rsi"])), ("binance-bot", "1H RSI SHORT", "SHORT", 88.0))
+        self.assertEqual((float(b["rsi_gap"]), float(b["ref_rsi"]), float(b["div_rsi"])),
+                         (sig["rsi_gap"], sig["rsi_ref"], sig["rsi_div"]))
+        self.assertEqual((float(b["ref_price"]), float(b["div_price"]), float(b["div_open"])),
+                         (sig["ref_price"], sig["div_price"], sig["div_open"]))
+        self.assertEqual(float(b["div_price"]), sig["stop_ref"])               # short: the divergence candle's high
+        self.assertEqual((float(b["ltp"]), float(b["stop_used"])), (px, t["stop"]))
+        self.assertAlmostEqual(float(b["size"]), t["contracts"] * t["cv"])
+        self.assertEqual(b["entry_check"], f"{px:g} < open {sig['div_open']:g}")
+        self.assertEqual(a["ltp"], "")                                         # ranked lower: no price lookup
+        self.assertEqual(len([c for c in self.fd.calls[n_before:] if c[1] == "5m"]), 2)  # no extra candle calls
+
+    def test_entry_check_and_cooldown_reasons(self):
+        end = T0 + 300
+        cands, sig = find_signal("short", 300, 45, end)
+        self.arm("short", [("AUSDT", 75.0), ("CUSDT", 74.0)])
+        self.fd.c5 = {"AUSDT": cands, "CUSDT": cands}
+        self.fd.px = {"AUSDT": sig["div_open"], "CUSDT": sig["div_open"]}
+        self.r.st["cooldown"]["CUSDT"] = end - 600
+        self.r.tick(end + 8)
+        a, c = self.rows()
+        self.assertEqual((a["reason"], a["entry_check"]), ("entry check", f"{sig['div_open']:g} >= open {sig['div_open']:g}"))
+        self.assertEqual(c["reason"], "cooldown")
+
+    def test_no_rows_while_book_busy(self):
+        self.arm("short", [("AUSDT", 75.0)])
+        self.b.book("1H RSI SHORT")["open_trade"] = {"symbol": "XUSDT", "product_id": 9, "side": "short"}
+        self.r.tick(T0 + 300 + 8)
+        self.assertFalse(os.path.exists(os.path.join(self.d, "candidates.csv")))
