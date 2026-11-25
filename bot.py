@@ -265,6 +265,12 @@ def make_cfg():
         "entry_slip_cap_pct": f("ENTRY_SLIP_CAP_PCT", 0.001),
         "liq_cap_pct": f("LIQ_CAP_PCT_OF_DEPTH", 0.20),
         "entry_max_children": i("ENTRY_MAX_CHILDREN", 20),
+        # limit exits (26 Nov 2026, 1H RSI books, paper): a TRAIL_STOP whose market exit would slip more than
+        # EXIT_SLIP_CAP_PCT on the live depth exits with limit children down to the trail stop - that %; the rest
+        # waits there and goes at market once price is back to entry + EXIT_GUARD_R x R (execution.py)
+        "exit_slip_cap_pct": f("EXIT_SLIP_CAP_PCT", 0.001),
+        "exit_guard_r": f("EXIT_GUARD_R", 0.5),
+        "exit_max_children": i("EXIT_MAX_CHILDREN", 20),
         "data_dir": BASE_DIR,
         "ua": "delta-rsi-ema-bot/1.0",
     }
@@ -2202,6 +2208,8 @@ class Bot:
     def exit_exec(self, t, res):
         """Exit execution numbers for trades.csv. Paper: the market exit's slippage estimated by walking the live
         depth (the P&L still uses the stop / candle price); live: the fill vs the level that triggered it."""
+        if res.get("exec"):
+            return res["exec"]                       # a limit exit: its simulated fills
         qty = t["contracts"] * t["cv"]
         sell = tside(t) == "long"
         try:
@@ -2214,16 +2222,95 @@ class Bot:
                 pct, money = execution.slippage("SELL" if sell else "BUY", levels[0][0], avg, got)
                 return {"exit_ref": levels[0][0], "exit_avg": avg, "exit_slip_pct": round(pct, 4),
                         "exit_slip_usd": round(money, 4), "exit_children": 1,
-                        "exit_estimated": "yes" if got >= qty - 1e-12 else f"yes (book holds {got:g} of {qty:g})"}
+                        "exit_estimated": "yes" if got >= qty - 1e-12 else f"yes (book holds {got:g} of {qty:g})",
+                        "exit_type": "market"}
             ref = t.get("tp") if res["reason"] == "TAKE_PROFIT" else t["stop"]
             if not ref:
                 return {}
             pct, money = execution.slippage("SELL" if sell else "BUY", ref, res["price"], qty)
             return {"exit_ref": ref, "exit_avg": res["price"], "exit_slip_pct": round(pct, 4),
-                    "exit_slip_usd": round(money, 4), "exit_children": 1, "exit_estimated": "no"}
+                    "exit_slip_usd": round(money, 4), "exit_children": 1, "exit_estimated": "no", "exit_type": "market"}
         except Exception as e:  # noqa: BLE001
             log.warning("exit slippage %s: %s", t["symbol"], e)
             return {}
+
+    # ---- limit exits (1H RSI books, paper; execution.py) ----
+    def start_limit_exit(self, t, res):
+        """TRAIL_STOP: when a market exit would slip more than exit_slip_cap_pct on the live depth, exit with limit
+        children from the best price down to the floor (trail stop - that %); the rest waits there (pending_exit,
+        saved in state.json) until it fills or price is back to entry + exit_guard_r x R. Returns False (the caller
+        exits at market as before) when the book is deep enough or unavailable."""
+        c, side = self.cfg, ("LONG" if tside(t) == "long" else "SHORT")
+        qty = round(t["contracts"] * t["cv"], 10)
+        try:
+            book = self.data.orderbook(t["symbol"], 20)
+        except Exception as e:  # noqa: BLE001
+            log.warning("limit exit %s: no order book (%s), exiting at market", t["symbol"], e)
+            return False
+        take = execution.exit_take_side(side)
+        levels = execution.our_side(book, take)
+        if not levels or not execution.exit_needs_limit(book, side, qty, c["exit_slip_cap_pct"]):
+            return False
+        mslip = execution.market_slip_pct(levels, qty, take)
+        sign = 1 if side == "LONG" else -1
+        guard = t["entry"] + sign * c["exit_guard_r"] * risk0(t)
+        pend = execution.start_exit(side, qty, t["tick"], t["stop"], c["exit_slip_cap_pct"], guard, res["reason"],
+                                    "trail")
+        pend.update(unit=t["cv"], trigger_ts=res["ts"])
+        t["pending_exit"] = pend
+        self.save_state()
+        venue = execution.PaperVenue(lambda: self.data.orderbook(t["symbol"], 20))
+        execution.exit_steps(pend, venue, t["cv"], t["tick"], book, sleep=time.sleep,
+                             max_children=c["exit_max_children"])
+        fmt = lambda x: fmt_price(x, t["tick"])  # noqa: E731
+        msg = (f"TRAIL STOP [{t['book']}] {t['symbol']} {tside(t).upper()}: market order would slip "
+               + ("more than the visible book holds" if mslip is None else f"{mslip:.3f}%")
+               + f" -> limit exit. Floor {fmt(pend['floor'])} (stop {fmt(t['stop'])} - {c['exit_slip_cap_pct'] * 100:g}%); "
+               f"filled {pend['qty'] - pend['left']:g}/{pend['qty']:g} in {pend['children']} order(s)")
+        if not execution.exit_done(pend):
+            msg += (f"; {pend['left']:g} waiting at {fmt(pend['floor'])}, market if price reaches {fmt(guard)} "
+                    f"(entry {'+' if sign > 0 else '-'} {c['exit_guard_r']:g}R)")
+        self.event("LIMIT_EXIT", book=t["book"], symbol=t["symbol"], side=tside(t), floor=pend["floor"], guard=guard,
+                   market_slip_pct=None if mslip is None else round(mslip, 4), filled=pend["qty"] - pend["left"],
+                   qty=pend["qty"], children=pend["children"])
+        self.tg.send(msg)
+        if execution.exit_done(pend):
+            self.finish_limit_exit(t)
+        else:
+            self.save_state()
+        return True
+
+    def step_limit_exit(self, t, now, force=None):
+        """A pending limit exit, every manage pass: the rest at market when the best bid (long) / ask (short) is
+        back at the guard (or force = a reason: session close / killswitch), else the resting limit is checked."""
+        pend = t["pending_exit"]
+        try:
+            book = self.data.orderbook(t["symbol"], 20)
+        except Exception as e:  # noqa: BLE001
+            log.warning("pending exit %s: no order book (%s)", t["symbol"], e)
+            if not force:
+                return
+            px = self.last_price(t["symbol"])
+            book = ([(px, pend["left"])], [(px, pend["left"])])
+        levels = execution.our_side(book, execution.exit_take_side(pend["side"]))
+        if force:
+            execution.exit_market(pend, book, force)
+        elif levels and execution.guard_crossed(pend["side"], levels[0][0], pend["guard"]):
+            execution.exit_market(pend, book, f"price back to entry {'+' if pend['side'] == 'LONG' else '-'} "
+                                              f"{self.cfg['exit_guard_r']:g}R")
+        else:
+            execution.exit_rest(pend, book, pend.get("unit") or 0)
+        if execution.exit_done(pend):
+            self.finish_limit_exit(t, now)
+        else:
+            self.save_state()
+
+    def finish_limit_exit(self, t, now=None):
+        pend = t.pop("pending_exit")
+        ex = execution.exit_summary(pend)
+        ex["exit_slip_usd"] = round(ex.pop("exit_slip_money") or 0.0, 4)
+        self.close_trade(t, {"reason": pend["reason"], "price": ex["exit_avg"], "ts": int(now or time.time()),
+                             "estimated": True, "exec": ex})
 
     def finish_entry(self, t, info, now):
         c = self.cfg
@@ -2247,7 +2334,8 @@ class Bot:
             x = t["extra"]
             self.tg.send(
                 f"{tside(t).upper()} ENTERED [{bk}] [{c['mode']}]\n{t['symbol']}\n"
-                f"Entry: {fmt(t['entry'])} (market; last price {x['last_price']:g})\n"
+                f"Entry: {fmt(t['entry'])} (last price {x['last_price']:g})\n"
+                + (f"{execution.entry_text(t['exec'], fmt)}\n" if t.get("exec") else "") +
                 f"Stop-loss: {fmt(t['stop'])} ({'widened to ' + format(self.rsi1h.c['min_stop_pct'], 'g') + '%' if x['stop_widened'] else '1 tick beyond the divergence candle'})\n"
                 f"Target: none - stop to entry at {t['be_r']:g}R, then trailing in whole R from {t['trail_start_r']:g}R\n"
                 f"Size: {t['contracts'] * t['cv']:g} (~${t['notional']:.0f} notional), {t['leverage']:g}x isolated, "
@@ -2531,9 +2619,24 @@ class Bot:
     def manage_open_trades(self, now):
         for _, t in self.open_trades():
             try:
+                if t.get("strategy") == "rsi1h" and t["mode"] == "PAPER":
+                    self.manage_rsi1h_paper(t, now)
+                    continue
                 self.manage_open_trade(t, now)
             except Exception:  # noqa: BLE001
                 log.exception("managing %s failed", t.get("symbol"))
+
+    def manage_rsi1h_paper(self, t, now):
+        """1H RSI paper trades: as manage_open_trade's paper path, plus limit exits for big TRAIL_STOP exits."""
+        if t.get("pending_exit"):
+            self.step_limit_exit(t, now)
+            return
+        res = self.check_exit_by_candles(t, now)
+        self.save_state()
+        if res:
+            if res["reason"] == "TRAIL_STOP" and self.start_limit_exit(t, res):
+                return
+            self.close_trade(t, res)
 
     def manage_open_trade(self, t, now):
         if t["mode"] == "PAPER":
@@ -2577,7 +2680,7 @@ class Bot:
     def close_trade(self, t, res):
         c = self.cfg
         exit_px = res["price"]
-        if t.get("strategy") == "rsi1h" and self.rsi1h:
+        if t.get("strategy") == "rsi1h" and self.rsi1h and not res.get("exec"):
             exit_px = self.rsi1h.exit_price(t, exit_px)            # RSI1H_SLIPPAGE_PCT against us (0 = none)
             self.rsi1h.on_close(t, res)                             # 30-min cooldown after a short
         n, cv = t["contracts"], t["cv"]
@@ -2624,7 +2727,7 @@ class Bot:
                            + [ee.get(k, "") for k in ("entry_ref", "entry_avg", "entry_slip_pct", "entry_slip_usd",
                                                       "entry_children", "qty_intended", "qty_filled", "liq_capped")]
                            + [xx.get(k, "") for k in ("exit_ref", "exit_avg", "exit_slip_pct", "exit_slip_usd",
-                                                      "exit_children", "exit_estimated")])
+                                                      "exit_children", "exit_estimated", "exit_type")])
                           if self.rsi1h else []))
         d = book["day"].get(dk, {})
         m = book["month"].get(mk, {})
@@ -2642,6 +2745,7 @@ class Bot:
             f"Est. fees: ${fees:.2f}\n"
             f"Net P/L: ${net:+.2f} (Rs {self.inr(net):+.0f})  [{r_mult:+.2f}R]\n"
             f"Duration: {human_dur(res['ts'] - t['opened_ts'])}\n"
+            + (f"{execution.exit_text(xx, fmt)}\n" if xx else "") +
             f"{bal_line}"
             f"{bk} today: {d.get('trades', 0)} trades, ${d.get('pnl', 0):+.2f} | Month: {m.get('trades', 0)} trades, ${m.get('pnl', 0):+.2f}"
             + ("\n(Exit price estimated from candle data.)" if res["estimated"] else "")
@@ -2716,6 +2820,9 @@ class Bot:
     def close_now(self, t, reason):
         """Close one position at market (session close / killswitch). Returns a short status text."""
         if t["mode"] == "PAPER":
+            if t.get("pending_exit"):                # a limit exit in progress: the rest at market
+                self.step_limit_exit(t, time.time(), force=reason)
+                return f"{t['symbol']} closed (paper)."
             px = self.last_price(t["symbol"])
             self.close_trade(t, {"reason": reason, "price": px, "ts": int(time.time()), "estimated": True})
             return f"{t['symbol']} closed (paper)."
