@@ -20,11 +20,16 @@ sys.path.insert(0, HERE)
 POC_BASELINE = "1536659"
 HOOKS = {"make_cfg", "book_for", "Bot.__init__", "Bot.enabled_books", "Bot.check_exit_by_candles",
          "Bot.finish_entry", "Bot.close_trade", "Bot.status_text", "Bot.strategy_desc", "Bot.startup", "Bot.tick",
-         "Binance.request"}
-ADDED = {"Bot.paused_books", "Bot.poc_pause_step"}          # POC_ENABLED=0 pause (24 Nov 2026)
+         "Binance.request",
+         # entry execution (25 Nov 2026): try_enter changes only after POC's `if sig.get("limit"): return` (the
+         # non-POC paper fill); enter_live only for the non-POC books; IOC reply type; depth limit (POC keeps 100)
+         "Bot.try_enter", "Bot.enter_live", "Binance.orderbook", "Binance.place_order"}
+ADDED = {"Bot.paused_books", "Bot.poc_pause_step",          # POC_ENABLED=0 pause (24 Nov 2026)
+         "Bot.capped_entry", "Bot.exit_exec", "BinanceLiveVenue.__init__", "BinanceLiveVenue.book",
+         "BinanceLiveVenue.ioc"}                            # entry execution (25 Nov 2026)
 POC_FUNCS = ("Bot.tick_poc", "Bot.poc_pending_step", "Bot.poc_filled", "Bot.poc_place_limit", "Bot.poc_cancel",
              "Bot.poc_take_at_poc", "Bot.build_pocs", "Bot.poc_tier1", "Bot.manage_poc_live", "Bot.touch_stop_price",
-             "Bot.set_touch_stop", "Bot.apply_trail", "Bot.apply_be", "Bot.try_enter", "Bot.entry_allowed",
+             "Bot.set_touch_stop", "Bot.apply_trail", "Bot.apply_be", "Bot.entry_allowed",
              "Bot.init_books", "Bot.sweep_retired", "Bot.session_tasks", "Bot.report", "Bot.in_us_session",
              "Bot.manage_open_trade", "Bot.run", "poc_price", "size_trade", "size_by_margin")
 ENV = {"EXCHANGE": "binance", "DRY_RUN": "1", "ENABLE_POC": "1", "ENABLE_SHORT": "0", "ENABLE_LONG": "0",
@@ -133,6 +138,8 @@ class PocUnchanged(unittest.TestCase):
         old, new = self.old.make_cfg(), self.new.make_cfg()
         self.assertEqual(new.pop("enable_rsi1h"), False)
         self.assertEqual(new.pop("poc_paused"), False)              # POC_ENABLED unset = running
+        for k, v in (("entry_slip_cap_pct", 0.001), ("liq_cap_pct", 0.2), ("entry_max_children", 20)):
+            self.assertEqual(new.pop(k), v)                         # entry execution (25 Nov 2026)
         old.pop("data_dir"), new.pop("data_dir")
         self.assertEqual(old, new)
 
