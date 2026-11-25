@@ -6,6 +6,7 @@ import random
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import rsi1h as R  # noqa: E402
@@ -186,6 +187,14 @@ class FakeData:
     def request(self, method, path, params=None):
         return {"price": str(self.px[params["symbol"]])}
 
+    def orderbook(self, sym, depth=100):   # deep book at the last price: the capped IOC entry fills there
+        self.calls.append((sym, "depth"))
+        if sym in getattr(self, "books", {}):
+            return self.books[sym]
+        px = self.px.get(sym, 1.0)
+        return [(px, 1e9)] + [(px * (1 - k * 1e-4), 1e9) for k in range(1, 5)], \
+            [(px, 1e9)] + [(px * (1 + k * 1e-4), 1e9) for k in range(1, 5)]
+
     def ticker(self, sym):
         return {"mark_price": self.px.get(sym, 0)}
 
@@ -325,7 +334,8 @@ class Runner(unittest.TestCase):
         self.assertGreater(x["net_pnl_usd"], 0)
         with open(os.path.join(self.d, "trades.csv"), newline="") as fh:
             rows = list(csv.reader(fh))
-        self.assertEqual(rows[0][-3:], ["session", "shadow_exit_pnl", "setup"])
+        self.assertEqual(rows[0][21:24], ["session", "shadow_exit_pnl", "setup"])
+        self.assertEqual(rows[0][24:], R.Rsi1h.TRADE_TAIL[3:])                  # execution columns
         self.assertEqual((rows[-1][19], rows[-1][10]), ("1H RSI SHORT", "TRAIL_STOP"))
         self.assertIn("RSI gap", rows[-1][23])
         self.assertEqual(self.b.book("POC RETURN")["balance"], 31.42)
@@ -361,7 +371,7 @@ class Runner(unittest.TestCase):
         t = self.b.book("1H RSI LONG")["open_trade"]
         self.assertEqual((t["side"], t["symbol"]), ("long", "LUSDT"))
         self.assertLess(t["stop"], t["entry"])
-        self.assertTrue(all(res in ("15m", "1m") for _, res in self.fd.calls))
+        self.assertTrue(all(res in ("15m", "1m", "depth") for _, res in self.fd.calls))
 
     def test_no_candle_fetch_while_book_busy(self):
         self.arm("short", [("AUSDT", 75.0)])
@@ -530,3 +540,51 @@ class StartupUniverse(Runner):
         self.assertEqual(len(calls), 1)
         self.r.tick(T0 + 161)
         self.assertEqual(len(calls), 2)
+
+
+class Execution(Runner):
+    """Liquidity cap and capped IOC entry for the 1H RSI books (paper: simulated on the live depth)."""
+    def go(self, bids):
+        end = T0 + 300
+        cands, sig = find_signal("short", 300, 45, end)
+        self.arm("short", [("AUSDT", 80.0)])
+        self.fd.c5 = {"AUSDT": cands}
+        px = round(sig["div_open"] * 0.999, 4)
+        self.fd.px = {"AUSDT": px}
+        self.fd.books = {"AUSDT": (bids(px), [(px * 1.0001, 1e9)])}
+        with mock.patch.object(self.bot_mod.time, "sleep", lambda s: None):
+            self.r.tick(end + 8)
+        with open(os.path.join(self.d, "candidates.csv"), newline="") as fh:
+            return px, list(csv.DictReader(fh))[-1]
+
+    def test_too_little_liquidity(self):
+        px, row = self.go(lambda px: [(px, 0.01)] * 5)          # 20% of 0.05 coins is under the $5 min notional
+        self.assertEqual((row["taken"], row["reason"], row["liq_capped"]), ("no", "too little liquidity", "yes"))
+        self.assertIsNone(self.b.book("1H RSI SHORT")["open_trade"])
+
+    def test_liquidity_cap_and_partial_fill(self):
+        # best bid holds 3 coins, the next level is 1% lower (beyond the 0.1% cap): 3 coins fill, the rest doesn't
+        px, row = self.go(lambda px: [(px, 3.0)] + [(round(px * 0.99, 4), 1000.0)] * 4)
+        t = self.b.book("1H RSI SHORT")["open_trade"]
+        self.assertAlmostEqual(t["contracts"] * t["cv"], 3.0)
+        self.assertEqual(t["entry"], px)
+        self.assertEqual((row["taken"], row["entry_ref"], float(row["qty_filled"]), row["liq_capped"]),
+                         ("yes", f"{px}", 3.0, "no"))
+        self.assertGreater(float(row["qty_intended"]), 3.0)
+        self.assertGreater(int(row["entry_children"]), 1)
+        self.assertEqual(float(row["entry_slip_pct"]), 0.0)
+        self.assertLess(abs(t["entry"] - t["stop"]) * 3.0, 5.0 + 1e-9)              # risk on what filled
+        self.assertIn("fill 3/", t["extra"]["detail"])
+        # exit: trades.csv gets the entry and the (paper-estimated) exit execution
+        self.b.close_trade(t, {"reason": "STOP_LOSS", "price": t["stop"], "ts": T0 + 900, "estimated": True})
+        with open(os.path.join(self.d, "trades.csv"), newline="") as fh:
+            tr = list(csv.DictReader(fh))[-1]
+        self.assertEqual((tr["entry_ref"], tr["qty_filled"], tr["exit_children"]), (f"{px}", "3.0", "1"))
+        self.assertTrue(tr["exit_estimated"].startswith("yes"))
+        self.assertEqual(tr["exit_ref"], f"{px * 1.0001}")                              # a short exit buys the ask
+
+    def test_liquidity_cap_cuts_the_size(self):
+        px, row = self.go(lambda px: [(px, 2.0)] * 5)            # 20% of 10 coins = 2 coins
+        t = self.b.book("1H RSI SHORT")["open_trade"]
+        self.assertAlmostEqual(t["contracts"] * t["cv"], 2.0)
+        self.assertEqual((row["liq_capped"], row["liq_cap_qty"], float(row["qty_intended"])), ("yes", "2.0", 2.0))

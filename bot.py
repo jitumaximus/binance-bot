@@ -107,6 +107,7 @@ from zoneinfo import ZoneInfo
 import requests
 
 import bookjump
+import execution
 import rsi1h
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -258,6 +259,12 @@ def make_cfg():
         "min_turnover_usd": f("MIN_TURNOVER_USD", 0),
         "workers": i("WORKERS", 6),
         "manage_interval": i("MANAGE_INTERVAL_SEC", 15),
+        # entry execution (25 Nov 2026; execution.py), every book except POC RETURN (a resting limit at its level):
+        # capped IOC limit children instead of a market order (paper: simulated on the live /fapi/v1/depth instead of
+        # filling at the last price); size capped at LIQ_CAP_PCT_OF_DEPTH of the top-5 levels on our side.
+        "entry_slip_cap_pct": f("ENTRY_SLIP_CAP_PCT", 0.001),
+        "liq_cap_pct": f("LIQ_CAP_PCT_OF_DEPTH", 0.20),
+        "entry_max_children": i("ENTRY_MAX_CHILDREN", 20),
         "data_dir": BASE_DIR,
         "ua": "delta-rsi-ema-bot/1.0",
     }
@@ -844,7 +851,8 @@ class Binance:
         return {"mark_price": fnum(x.get("markPrice"))}
 
     def orderbook(self, symbol, depth=100):
-        d = self.request("GET", "/fapi/v1/depth", params={"symbol": symbol, "limit": 100})
+        limit = depth if depth in (5, 10, 20, 50, 100, 500, 1000) else 100     # weight: <=50 -> 2, 100 -> 5
+        d = self.request("GET", "/fapi/v1/depth", params={"symbol": symbol, "limit": limit})
         return ([(fnum(p), fnum(q)) for p, q in d.get("bids") or []],
                 [(fnum(p), fnum(q)) for p, q in d.get("asks") or []])
 
@@ -897,13 +905,15 @@ class Binance:
         if body.get("order_type") == "limit_order":
             tif = "GTX" if body.get("post_only") else "IOC" if body.get("time_in_force") == "ioc" else "GTC"
             p.update(type="LIMIT", price=body["limit_price"], timeInForce=tif)
+            if tif == "IOC":
+                p["newOrderRespType"] = "RESULT"                 # the reply then carries executedQty / avgPrice
         else:
             p["type"] = "MARKET"
         if body.get("client_order_id"):
             p["newClientOrderId"] = re.sub(r"[^A-Za-z0-9_.:/-]", "", str(body["client_order_id"]))[:36]
         r = self.request("POST", "/fapi/v1/order", params=p, signed=True)
         return {"id": str(r.get("orderId")), "state": str(r.get("status", "")).lower(),
-                "average_fill_price": fnum(r.get("avgPrice"))}
+                "average_fill_price": fnum(r.get("avgPrice")), "filled_qty": fnum(r.get("executedQty"))}
 
     def bracket(self, product_id, symbol, sl, tp, trigger):
         raise DeltaError("bracket orders are not used on Binance; protection is placed as separate orders")
@@ -951,6 +961,28 @@ class Binance:
 # --------------------------------------------------------------------------
 # Telegram
 # --------------------------------------------------------------------------
+class BinanceLiveVenue:
+    """Live IOC limit children for execution.run_entry (Binance). A rejected child counts as unfilled."""
+
+    def __init__(self, api, data, t):
+        self.api, self.data, self.t = api, data, t
+
+    def book(self):
+        return self.data.orderbook(self.t["symbol"], 20)
+
+    def ioc(self, side, price, qty, book=None):
+        t = self.t
+        try:
+            r = self.api.place_order({"product_id": t["product_id"], "size": int(round(qty / t["cv"])),
+                                      "side": "buy" if side == "LONG" else "sell", "order_type": "limit_order",
+                                      "limit_price": fmt_price(price, t["tick"]), "time_in_force": "ioc"})
+        except Exception as ex:  # noqa: BLE001
+            log.warning("IOC child %s %s @ %s: %s", t["symbol"], qty, price, ex)
+            return 0.0, None
+        got = fnum(r.get("filled_qty"))
+        return got, (fnum(r.get("average_fill_price")) or None) if got > 0 else None
+
+
 class Telegram:
     def __init__(self, token, chat_id):
         self.token, self.chat_id = token, str(chat_id or "")
@@ -1981,6 +2013,21 @@ class Bot:
         if sig.get("limit"):
             return trade, info
         if c["dry_run"]:
+            # paper: capped IOC entry simulated on the live depth (was: filled at the signal candle's close)
+            mn = getattr(self.data, "meta", {}).get(p["id"], {}).get("min_notional", 5)
+            why = self.capped_entry(trade, mn)
+            if why:
+                self.event("SKIP", side=side, symbol=sig["symbol"], book=bk, reason=why, execution=trade.get("exec"))
+                return
+            fill = trade["entry"]
+            if (side == "short" and stop <= fill) or (side == "long" and stop >= fill):
+                self.event("SKIP", side=side, symbol=sig["symbol"], book=bk, reason="fill past stop")
+                return
+            if trade.get("tp"):
+                risk_f = abs(fill - stop)
+                trade["tp"] = round_tick(fill - RR * risk_f if side == "short" else fill + RR * risk_f, tick, "nearest")
+            info = dict(info, notional=trade["contracts"] * p["cv"] * fill,
+                        margin=trade["contracts"] * p["cv"] * fill / c["leverage"])
             self.finish_entry(trade, info, now)
             return
         try:
@@ -1999,11 +2046,22 @@ class Bot:
         # The margin-based stop assumes this exact leverage, so do not trade if it cannot be set.
         self.api.set_leverage(t["product_id"], int(math.ceil(c["leverage"])))
         cid = f"rsi{tside(t)}-{int(time.time())}"
-        res = self.api.place_order({"product_id": t["product_id"], "size": t["contracts"],
-                                    "side": "sell" if tside(t) == "short" else "buy",
-                                    "order_type": "market_order", "client_order_id": cid})
-        self.event("ORDER_SENT", symbol=t["symbol"], size=t["contracts"], client_order_id=cid,
-                   state=res.get("state"))
+        if c["exchange"] == "binance":       # capped IOC limit children (execution.py) instead of a market order
+            mn = getattr(self.api, "meta", {}).get(t["product_id"], {}).get("min_notional", 5)
+            why = self.capped_entry(t, mn)
+            self.event("ORDER_SENT", symbol=t["symbol"], size=t["contracts"], client_order_id=cid,
+                       execution=t.get("exec"), skipped=why or None)
+            if why:
+                t["aborted"] = True
+                self.event("SKIP", symbol=t["symbol"], book=t["book"], reason=why, execution=t.get("exec"))
+                return
+            res = {"average_fill_price": t["entry"]}
+        else:
+            res = self.api.place_order({"product_id": t["product_id"], "size": t["contracts"],
+                                        "side": "sell" if tside(t) == "short" else "buy",
+                                        "order_type": "market_order", "client_order_id": cid})
+            self.event("ORDER_SENT", symbol=t["symbol"], size=t["contracts"], client_order_id=cid,
+                       state=res.get("state"))
         pos = None
         for _ in range(10):
             time.sleep(1)
@@ -2103,6 +2161,70 @@ class Bot:
         self.event("ABORTED", symbol=t["symbol"], reason=reason)
         self.tg.send(f"TRADE ABORTED {t['symbol']}: {reason}. Position was closed at market.")
 
+    def capped_entry(self, t, min_notional, book=None):
+        """Liquidity cap + capped IOC entry (execution.py) for trade t (side, symbol, product_id, contracts, cv = qty
+        step, tick). Paper: simulated on the live /fapi/v1/depth; live: BinanceLiveVenue. Returns "" when something
+        filled (t updated: contracts = filled, entry = average fill, exec = the numbers), else the short skip reason
+        ("no order book", "too little liquidity", "no fill within cap"); t["exec"] holds what is known."""
+        c, step = self.cfg, t["cv"]
+        side = "LONG" if tside(t) == "long" else "SHORT"
+        ex = t["exec"] = {}
+        if book is None:
+            try:
+                book = self.data.orderbook(t["symbol"], 20)
+            except Exception as e:  # noqa: BLE001
+                log.warning("order book %s: %s", t["symbol"], e)
+                return "no order book"
+        levels = execution.our_side(book, side)
+        if not levels:
+            return "no order book"
+        ref = levels[0][0]
+        qty = round(t["contracts"] * step, 10)
+        capped, max_q, depth5 = execution.liquidity_cap(qty, step, levels, c["liq_cap_pct"])
+        ex.update(depth5_qty=round(depth5, 10), liq_cap_qty=max_q, liq_capped="yes" if capped < qty - 1e-12 else "no",
+                  qty_risk=qty, entry_ref=ref)
+        if capped < step - 1e-12 or capped * ref < min_notional - 1e-9:
+            return "too little liquidity"
+        min_units = math.ceil(min_notional / ref / step - 1e-9) * step
+        venue = (execution.PaperVenue(lambda: self.data.orderbook(t["symbol"], 20)) if c["dry_run"]
+                 else BinanceLiveVenue(self.api, self.data, t))
+        r = execution.run_entry(venue, side, capped, step, t["tick"], c["entry_slip_cap_pct"], book,
+                                min_units=min_units, sleep=time.sleep, max_children=c["entry_max_children"])
+        ex.update(entry_cap=r["cap"], entry_children=r["children"], qty_intended=capped, qty_filled=r["filled"])
+        if r["filled"] < step - 1e-12 or not r["avg"]:
+            return "no fill within cap"
+        pct, money = execution.slippage("BUY" if side == "LONG" else "SELL", ref, r["avg"], r["filled"])
+        ex.update(entry_avg=r["avg"], entry_slip_pct=round(pct, 4), entry_slip_usd=round(money, 4))
+        t["contracts"] = int(round(r["filled"] / step))
+        t["entry"] = r["avg"]
+        return ""
+
+    def exit_exec(self, t, res):
+        """Exit execution numbers for trades.csv. Paper: the market exit's slippage estimated by walking the live
+        depth (the P&L still uses the stop / candle price); live: the fill vs the level that triggered it."""
+        qty = t["contracts"] * t["cv"]
+        sell = tside(t) == "long"
+        try:
+            if self.cfg["dry_run"]:
+                bids, asks = self.data.orderbook(t["symbol"], 20)
+                levels = bids if sell else asks
+                if not levels:
+                    return {}
+                got, avg = execution.walk_market(levels, qty)
+                pct, money = execution.slippage("SELL" if sell else "BUY", levels[0][0], avg, got)
+                return {"exit_ref": levels[0][0], "exit_avg": avg, "exit_slip_pct": round(pct, 4),
+                        "exit_slip_usd": round(money, 4), "exit_children": 1,
+                        "exit_estimated": "yes" if got >= qty - 1e-12 else f"yes (book holds {got:g} of {qty:g})"}
+            ref = t.get("tp") if res["reason"] == "TAKE_PROFIT" else t["stop"]
+            if not ref:
+                return {}
+            pct, money = execution.slippage("SELL" if sell else "BUY", ref, res["price"], qty)
+            return {"exit_ref": ref, "exit_avg": res["price"], "exit_slip_pct": round(pct, 4),
+                    "exit_slip_usd": round(money, 4), "exit_children": 1, "exit_estimated": "no"}
+        except Exception as e:  # noqa: BLE001
+            log.warning("exit slippage %s: %s", t["symbol"], e)
+            return {}
+
     def finish_entry(self, t, info, now):
         c = self.cfg
         dk, mk = period_keys(now)
@@ -2118,7 +2240,8 @@ class Bot:
                    take_profit=t["tp"], contracts=t["contracts"], risk_usd=round(t["risk_usd"], 2),
                    notional_usd=round(t["notional"], 2), rsi_4h=t["rsi"], stop_source=t.get("stop_source"),
                    leverage=t.get("leverage"), margin_usd=round(t.get("margin", 0.0), 2),
-                   orderbook=t.get("ob"), **({"setup": t["extra"].get("detail")} if t.get("strategy") == "rsi1h" else {}))
+                   orderbook=t.get("ob"), **({"execution": t["exec"]} if t.get("exec") else {}),
+                   **({"setup": t["extra"].get("detail")} if t.get("strategy") == "rsi1h" else {}))
         fmt = lambda x: fmt_price(x, t["tick"])  # noqa: E731
         if t.get("strategy") == "rsi1h":
             x = t["extra"]
@@ -2478,10 +2601,12 @@ class Bot:
         book["open_trade"] = None
         self.save_state()
         fmt = lambda x: fmt_price(x, t["tick"])  # noqa: E731
+        xx = self.exit_exec(t, res)
         self.event("EXIT", book=bk, side=tside(t), symbol=t["symbol"], reason=res["reason"], exit_price=exit_px, entry=t["entry"],
                    stop_loss=t["stop"], take_profit=t["tp"], gross_pnl_usd=round(gross, 4),
                    est_fees_usd=round(fees, 4), net_pnl_usd=round(net, 4), r_multiple=round(r_mult, 2),
-                   estimated=res["estimated"])
+                   estimated=res["estimated"], **({"execution": xx} if xx else {}))
+        ee = t.get("exec") or {}
         new_file = not os.path.exists(self.trades_file)
         with open(self.trades_file, "a", newline="") as fh:
             w = csv.writer(fh)
@@ -2495,7 +2620,12 @@ class Bot:
                         round(gross, 4), round(fees, 4), round(net, 4), round(self.inr(net), 2),
                         round(r_mult, 2), "" if t.get("rsi") is None else t.get("rsi"), res["estimated"],
                         (t.get("ob") or {}).get("ratio", ""), bk, round(book["balance"], 4)]
-                       + (["", "", (t.get("extra") or {}).get("detail", "")] if t.get("strategy") == "rsi1h" else []))
+                       + ((["", "", (t.get("extra") or {}).get("detail", "") if t.get("strategy") == "rsi1h" else ""]
+                           + [ee.get(k, "") for k in ("entry_ref", "entry_avg", "entry_slip_pct", "entry_slip_usd",
+                                                      "entry_children", "qty_intended", "qty_filled", "liq_capped")]
+                           + [xx.get(k, "") for k in ("exit_ref", "exit_avg", "exit_slip_pct", "exit_slip_usd",
+                                                      "exit_children", "exit_estimated")])
+                          if self.rsi1h else []))
         d = book["day"].get(dk, {})
         m = book["month"].get(mk, {})
         bal_line = (f"{bk} balance: ${book['balance']:.2f} (Rs {self.inr(book['balance']):,.0f})"

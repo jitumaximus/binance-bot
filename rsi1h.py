@@ -50,7 +50,10 @@ CAND_COLS = ["time", "bot", "book", "symbol", "side", "check", "taken", "reason"
              "range_low", "range_high", "candle_open", "ltp", "move_pct", "candle_colour", "gap_pct", "beyond_pct",
              "arm_rsi", "ref_time", "ref_price", "ref_rsi", "div_time", "div_price", "div_rsi", "rsi_gap",
              "div_open", "entry_check", "level", "distance_pct", "stop_candle", "stop_used", "stop_pct", "size",
-             "vol24h_usdt", "rank_by"]   # binance-bot only (appended, so the shared columns line up with fyers')
+             "vol24h_usdt", "rank_by",   # binance-bot only
+             # execution (25 Nov 2026), as in the fyers-bot (by name); qty_* in coins, size = coins traded
+             "depth5_qty", "liq_cap_qty", "liq_capped", "entry_ref", "entry_cap", "entry_avg", "entry_slip_pct",
+             "entry_slip_money", "entry_children", "qty_intended", "qty_filled"]
 
 
 def load_cfg(env=None):
@@ -272,7 +275,12 @@ class Rsi1h:
     TRADE_HEAD = ["open_time_ist", "close_time_ist", "mode", "symbol", "side", "contracts", "entry", "stop_loss",
                   "take_profit", "exit_price", "exit_reason", "gross_pnl_usd", "est_fees_usd", "net_pnl_usd",
                   "net_pnl_inr", "r_multiple", "rsi_4h", "exit_estimated", "ob_ratio", "strategy", "book_balance_usd"]
-    TRADE_TAIL = ["session", "shadow_exit_pnl", "setup"]   # session/shadow: BOOK JUMP's (kept); setup: 1H RSI
+    TRADE_TAIL = ["session", "shadow_exit_pnl", "setup",   # session/shadow: BOOK JUMP's (kept); setup: 1H RSI
+                  # execution (25 Nov 2026), every book: entry = capped IOC children, exit = market (paper: estimated
+                  # on the live depth); slip: positive = worse than the reference; qty in coins
+                  "entry_ref", "entry_avg", "entry_slip_pct", "entry_slip_usd", "entry_children", "qty_intended",
+                  "qty_filled", "liq_capped", "exit_ref", "exit_avg", "exit_slip_pct", "exit_slip_usd", "exit_children",
+                  "exit_estimated"]
 
     def ensure_trades_header(self):
         """trades.csv ends with ...,session,shadow_exit_pnl,setup. Only the header line is touched (older rows simply
@@ -464,6 +472,11 @@ class Rsi1h:
                    "stop_pct": round(c["stop_pct"], 3) if c.get("stop_pct") is not None else None,
                    "size": c.get("size"), "vol24h_usdt": round(sig["vol24h"]) if sig.get("vol24h") else None,
                    "rank_by": rank_by}
+            x = c.get("exec") or {}
+            row.update({k: x.get(k) for k in ("depth5_qty", "liq_cap_qty", "liq_capped", "entry_ref", "entry_cap",
+                                              "entry_avg", "entry_slip_pct", "entry_children", "qty_intended",
+                                              "qty_filled")})
+            row["entry_slip_money"] = x.get("entry_slip_usd")
             path = os.path.join(self.b.cfg["data_dir"], "candidates.csv")
             new = not os.path.exists(path)
             with open(path, "a", newline="") as fh:
@@ -515,8 +528,15 @@ class Rsi1h:
         if side == "long" and not px > sig["div_open"]:
             return self.skip(sig, book, f"price {px:g} not above the green divergence candle's open {sig['div_open']:g}",
                              "entry check")
-        slip = c["slippage_pct"] / 100.0
-        entry = px * (1 - slip) if side == "short" else px * (1 + slip)
+        # reference = best ask (long) / best bid (short) now: it sizes the trade; the capped IOC entry then fills
+        try:
+            ob = b.data.orderbook(sym, 20)
+        except Exception as ex:  # noqa: BLE001
+            return self.skip(sig, book, f"order book lookup failed: {str(ex)[:120]}", "no order book")
+        lv = ob[1] if side == "long" else ob[0]
+        if not lv:
+            return self.skip(sig, book, "empty order book", "no order book")
+        entry = lv[0][0]
         stop, candle_stop, widened = stop_for(side, sig["stop_ref"], entry, p["tick"],
                                               b.cfg.get("stop_buffer_ticks", 1), c["min_stop_pct"])
         cand.update(stop_candle=candle_stop, stop_used=stop, stop_pct=abs(entry - stop) / entry * 100)
@@ -527,10 +547,28 @@ class Rsi1h:
         if n < 1:
             return self.skip(sig, book, f"size: {info.get('skip')}", "size (min notional)")
         cand["size"] = n * p["cv"]
+        tx = {"side": side, "symbol": sym, "product_id": p["id"], "contracts": n, "cv": p["cv"], "tick": p["tick"]}
+        why = b.capped_entry(tx, p["min_notional"], ob)
+        cand["exec"] = tx.get("exec")
+        if why:
+            return self.skip(sig, book, f"{why} (liquidity cap / capped IOC entry)", why)
+        n, entry = tx["contracts"], tx["entry"]
+        cand["size"] = n * p["cv"]
+        stop, candle_stop, widened = stop_for(side, sig["stop_ref"], entry, p["tick"],
+                                              b.cfg.get("stop_buffer_ticks", 1), c["min_stop_pct"])
+        cand.update(stop_candle=candle_stop, stop_used=stop, stop_pct=abs(entry - stop) / entry * 100)
+        if (side == "short" and stop <= entry) or (side == "long" and (stop >= entry or stop <= 0)):
+            return self.skip(sig, book, "average fill is already beyond the stop", "fill past stop")
+        info.update(notional=n * p["cv"] * entry, risk_usd=n * p["cv"] * abs(entry - stop),
+                    margin=n * p["cv"] * entry / c["leverage"])
         stop_pct = abs(entry - stop) / entry * 100
         detail = sig["detail"] + (f" | stop {stop:g} widened to {c['min_stop_pct']:g}% (candle stop {candle_stop:g} "
                                   f"was {abs(entry - candle_stop) / entry * 100:.2f}%)" if widened else
                                   f" | stop {stop:g} ({stop_pct:.2f}%, 1 tick beyond the divergence candle)")
+        x = tx["exec"]
+        detail += (f" | fill {n * p['cv']:g}/{x['qty_intended']:g} @ {entry:g} (ref {x['entry_ref']:g}, cap {x['entry_cap']:g}, "
+                   f"{x['entry_children']} IOC, slippage {x['entry_slip_pct']:+.3f}% = ${x['entry_slip_usd']:.4f}"
+                   + (", liquidity cap" if x["liq_capped"] == "yes" else "") + ")")
         if widened:
             b.event("RSI1H_STOP_WIDENED", book=book, symbol=sym, candle_stop=candle_stop, stop=stop,
                     candle_stop_pct=round(abs(entry - candle_stop) / entry * 100, 3), min_pct=c["min_stop_pct"])
@@ -542,7 +580,7 @@ class Rsi1h:
                        "candle_stop": candle_stop, "stop_widened": widened, "last_price": px,
                        "slippage_pct": c["slippage_pct"]},
              "ob": None, "setup_time": sig["div_time"], "opened_ts": int(now), "last_checked": int(now),
-             "equity": equity, "protected": None, "stop_source": "widened" if widened else "candle",
+             "equity": equity, "protected": None, "stop_source": "widened" if widened else "candle", "exec": tx["exec"],
              "leverage": c["leverage"], "margin": info["margin"],
              # exits: no target, BE at 1R, whole-R trail from 3R (read per trade by bot.check_exit_by_candles)
              "trail": True, "trail_r": 0, "stop_set": True, "touch_close": 0, "tc_low": entry, "tc_high": entry,
