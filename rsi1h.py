@@ -43,6 +43,12 @@ LONG_BOOK, SHORT_BOOK = "1H RSI LONG", "1H RSI SHORT"
 BOOKS = (LONG_BOOK, SHORT_BOOK)
 P1H, P5M, P15M = 3600, 300, 900
 N_CANDLES = 98                       # Binance klines: limit < 100 = request weight 1 (candles() asks for count + 1)
+# candidates.csv (next to trades.csv): one row per divergence signal at each 5m / 15m check, taken or not. Same columns
+# as the fyers-bot's data/candidates.csv; *_pct are percentages, blank = not applicable. No extra API calls.
+CAND_COLS = ["time", "bot", "book", "symbol", "side", "check", "taken", "reason", "rank",
+             "range_low", "range_high", "candle_open", "ltp", "move_pct", "candle_colour", "gap_pct", "beyond_pct",
+             "arm_rsi", "ref_time", "ref_price", "ref_rsi", "div_time", "div_price", "div_rsi", "rsi_gap",
+             "div_open", "entry_check", "level", "distance_pct", "stop_candle", "stop_used", "stop_pct", "size"]
 
 
 def load_cfg(env=None):
@@ -170,7 +176,9 @@ def div_trigger(cands, side, window_min, min_gap=2, min_diff=3.0, ema_len=5, rsi
                   f"green {hm(d['time'])} low {d['low']:g} RSI {rb}; RSI gap {rg} (>= {min_diff:g}) "
                   f"-> bullish divergence")
         stop_ref = d["low"]
+    key = "high" if side == "short" else "low"
     return {"side": side, "stop_ref": stop_ref, "div_open": d["open"], "div_time": d["time"], "ref_time": p["time"],
+            "ref_price": p[key], "div_price": d[key],
             "rsi_ref": ra, "rsi_div": rb, "rsi_gap": rg, "rsi_gap_exact": diff, "between": between, "detail": detail}
 
 
@@ -390,14 +398,54 @@ class Rsi1h:
                     sig.update(symbol=sym, rsi1h=armed[sym]["rsi"])
                     sigs.append(sig)
         sigs.sort(key=lambda s: -s["rsi1h"] if side == "short" else s["rsi1h"])   # most extreme 1H RSI first
-        for sig in sigs:
-            book = SHORT_BOOK if side == "short" else LONG_BOOK
+        book = SHORT_BOOK if side == "short" else LONG_BOOK
+        taken = None
+        for rank, sig in enumerate(sigs, 1):
             self.b.event("RSI1H_SIGNAL", book=book, side=side, symbol=sig["symbol"], rsi_1h=sig["rsi1h"],
                          rsi_ref=sig["rsi_ref"], rsi_div=sig["rsi_div"], rsi_gap=sig["rsi_gap"],
                          div_candle_open=sig["div_open"], stop_ref=sig["stop_ref"], detail=sig["detail"])
             self.enter(sig, now)
+            if "skip_reason" not in sig and not self.b.book_free(book):
+                taken = sig["symbol"]
+                sig["taken"] = True
+            elif taken and sig.get("skip_reason", "").startswith("book busy"):
+                sig["skip_reason"] = "ranked lower"
+            self.candidate(sig, book, rank, f"{tf} close", now)
 
-    def skip(self, sig, book, reason):
+    def candidate(self, sig, book, rank, check, now):
+        """One candidates.csv row. Never raises: a logging problem must not affect trading."""
+        try:
+            c = sig.get("cand") or {}
+            px = c.get("ltp")
+            row = {"time": datetime.fromtimestamp(now, IST).strftime("%Y-%m-%d %H:%M:%S"), "bot": "binance-bot",
+                   "book": book, "symbol": sig["symbol"], "side": sig["side"].upper(), "check": check,
+                   "taken": "yes" if sig.get("taken") else "no",
+                   "reason": "" if sig.get("taken") else sig.get("skip_reason", ""), "rank": rank,
+                   "ltp": px, "arm_rsi": sig["rsi1h"],
+                   "ref_time": datetime.fromtimestamp(sig["ref_time"], IST).strftime("%Y-%m-%d %H:%M"),
+                   "ref_price": sig["ref_price"], "ref_rsi": sig["rsi_ref"],
+                   "div_time": datetime.fromtimestamp(sig["div_time"], IST).strftime("%Y-%m-%d %H:%M"),
+                   "div_price": sig["div_price"], "div_rsi": sig["rsi_div"], "rsi_gap": sig["rsi_gap"],
+                   "div_open": sig["div_open"],
+                   "entry_check": (f"{px:g} {'<' if px < sig['div_open'] else '>='} open {sig['div_open']:g}"
+                                   if px and sig["side"] == "short" else
+                                   f"{px:g} {'>' if px > sig['div_open'] else '<='} open {sig['div_open']:g}" if px else ""),
+                   "stop_candle": c.get("stop_candle"), "stop_used": c.get("stop_used"),
+                   "stop_pct": round(c["stop_pct"], 3) if c.get("stop_pct") is not None else None,
+                   "size": c.get("size")}
+            path = os.path.join(self.b.cfg["data_dir"], "candidates.csv")
+            new = not os.path.exists(path)
+            with open(path, "a", newline="") as fh:
+                w = csv.DictWriter(fh, fieldnames=CAND_COLS, extrasaction="ignore")
+                if new:
+                    w.writeheader()
+                w.writerow({k: ("" if v is None else v) for k, v in row.items()})
+        except Exception as ex:  # noqa: BLE001
+            log.warning("candidates.csv: %s", ex)
+
+    def skip(self, sig, book, reason, short=None):
+        """short: the reason as written in candidates.csv (book busy, cooldown, entry check, size, ...)."""
+        sig["skip_reason"] = short or reason
         self.b.event("RSI1H_SKIP", book=book, side=sig["side"], symbol=sig["symbol"], reason=reason,
                      rsi_1h=sig["rsi1h"], rsi_gap=sig["rsi_gap"])
 
@@ -410,38 +458,44 @@ class Rsi1h:
         side, sym = sig["side"], sig["symbol"]
         book = SHORT_BOOK if side == "short" else LONG_BOOK
         p = self.prods.get(sym)
+        cand = sig.setdefault("cand", {})          # numbers for candidates.csv
         if b.state.get("paused"):
-            return self.skip(sig, book, "bot is paused")
+            return self.skip(sig, book, "bot is paused", "paused")
         if not b.book_free(book):
-            return self.skip(sig, book, f"{book} already has a trade open")
+            return self.skip(sig, book, f"{book} already has a trade open", "book busy")
         if p is None:
-            return self.skip(sig, book, "not in the universe any more")
+            return self.skip(sig, book, "not in the universe any more", "not in universe")
         if any(t["product_id"] == p["id"] for _, t in b.open_trades()):
-            return self.skip(sig, book, "this coin is already held by another book")
+            return self.skip(sig, book, "this coin is already held by another book", "held by another book")
         last = self.st["cooldown"].get(sym)
         if side == "short" and last and now - last < c["cooldown_min"] * 60:
             return self.skip(sig, book, f"cooldown: last {sym} short closed {(now - last) / 60:.0f} min ago "
-                                        f"(< {c['cooldown_min']:g} min)")
+                                        f"(< {c['cooldown_min']:g} min)", "cooldown")
         try:
             px = self.last_trade_price(sym)
         except Exception as ex:  # noqa: BLE001
-            return self.skip(sig, book, f"price lookup failed: {str(ex)[:120]}")
+            return self.skip(sig, book, f"price lookup failed: {str(ex)[:120]}", "no price")
         if px <= 0:
             return self.skip(sig, book, "no price")
+        cand["ltp"] = px
         if side == "short" and not px < sig["div_open"]:
-            return self.skip(sig, book, f"price {px:g} not below the red divergence candle's open {sig['div_open']:g}")
+            return self.skip(sig, book, f"price {px:g} not below the red divergence candle's open {sig['div_open']:g}",
+                             "entry check")
         if side == "long" and not px > sig["div_open"]:
-            return self.skip(sig, book, f"price {px:g} not above the green divergence candle's open {sig['div_open']:g}")
+            return self.skip(sig, book, f"price {px:g} not above the green divergence candle's open {sig['div_open']:g}",
+                             "entry check")
         slip = c["slippage_pct"] / 100.0
         entry = px * (1 - slip) if side == "short" else px * (1 + slip)
         stop, candle_stop, widened = stop_for(side, sig["stop_ref"], entry, p["tick"],
                                               b.cfg.get("stop_buffer_ticks", 1), c["min_stop_pct"])
+        cand.update(stop_candle=candle_stop, stop_used=stop, stop_pct=abs(entry - stop) / entry * 100)
         if (side == "short" and stop <= entry) or (side == "long" and (stop >= entry or stop <= 0)):
-            return self.skip(sig, book, "entry is already beyond the stop")
+            return self.skip(sig, book, "entry is already beyond the stop", "price past stop")
         equity = b.book(book)["balance"]
         n, info = size_for(equity, c["risk_pct"], c["leverage"], entry, stop, p["cv"], p["min_notional"])
         if n < 1:
-            return self.skip(sig, book, f"size: {info.get('skip')}")
+            return self.skip(sig, book, f"size: {info.get('skip')}", "size (min notional)")
+        cand["size"] = n * p["cv"]
         stop_pct = abs(entry - stop) / entry * 100
         detail = sig["detail"] + (f" | stop {stop:g} widened to {c['min_stop_pct']:g}% (candle stop {candle_stop:g} "
                                   f"was {abs(entry - candle_stop) / entry * 100:.2f}%)" if widened else
