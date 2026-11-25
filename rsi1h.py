@@ -280,7 +280,9 @@ class Rsi1h:
                   # on the live depth); slip: positive = worse than the reference; qty in coins
                   "entry_ref", "entry_avg", "entry_slip_pct", "entry_slip_usd", "entry_children", "qty_intended",
                   "qty_filled", "liq_capped", "exit_ref", "exit_avg", "exit_slip_pct", "exit_slip_usd", "exit_children",
-                  "exit_estimated"]
+                  "exit_estimated",
+                  # 26 Nov 2026: market / limit / limit+market (limit: TRAIL_STOP whose market exit would slip > 0.1%)
+                  "exit_type"]
 
     def ensure_trades_header(self):
         """trades.csv ends with ...,session,shadow_exit_pnl,setup. Only the header line is touched (older rows simply

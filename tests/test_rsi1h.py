@@ -1,6 +1,7 @@
 """1H RSI LONG / 1H RSI SHORT (rsi1h.py): divergence rule, stop, sizing, hourly scan, entries, exits, cooldown.
 Run: venv/bin/python -m unittest discover -s tests -v   (no network: a fake Binance data client)"""
 import csv
+import math
 import os
 import random
 import sys
@@ -588,3 +589,88 @@ class Execution(Runner):
         t = self.b.book("1H RSI SHORT")["open_trade"]
         self.assertAlmostEqual(t["contracts"] * t["cv"], 2.0)
         self.assertEqual((row["liq_capped"], row["liq_cap_qty"], float(row["qty_intended"])), ("yes", "2.0", 2.0))
+
+
+class LimitExits(Runner):
+    """26 Nov 2026: a TRAIL_STOP whose market exit would slip > 0.1% exits with limit orders (paper, simulated on the
+    live depth); the rest waits at the floor and goes at market once price is back to entry - 0.5R (short)."""
+    go = Execution.go
+
+    def open_short(self):
+        px, _ = self.go(lambda px: [(px, 1e9)] * 5)
+        t = self.b.book("1H RSI SHORT")["open_trade"]
+        r0 = abs(t["stop"] - t["entry"])
+        t["trail_r"], t["be_moved"] = 3, True
+        t["stop"] = round(t["entry"] - 2 * r0, 2)                 # 2R locked
+        self.q = round(t["contracts"] * t["cv"], 10)
+        self.half = round(math.floor(self.q / 2 / t["cv"]) * t["cv"], 10)
+        return t, r0
+
+    def rows(self):
+        with open(os.path.join(self.d, "trades.csv"), newline="") as fh:
+            return list(csv.DictReader(fh))
+
+    def res(self, t):
+        return {"reason": "TRAIL_STOP", "price": t["stop"], "ts": T0 + 3600, "estimated": True}
+
+    def test_deep_book_trail_stop_stays_market(self):
+        t, _ = self.open_short()
+        self.fd.books = {"AUSDT": ([(t["stop"], 1e9)], [(t["stop"], 1e9)])}
+        self.assertFalse(self.b.start_limit_exit(t, self.res(t)))
+
+    def test_thin_book_limit_then_rest_fills(self):
+        t, r0 = self.open_short()
+        s = t["stop"]
+        self.fd.books = {"AUSDT": ([(s, 1e9)], [(s, self.half), (round(s * 1.01, 2), 1e9)])}
+        with mock.patch.object(self.bot_mod.time, "sleep", lambda x: None):
+            with mock.patch.object(self.b, "check_exit_by_candles", lambda t, now: self.res(t)):
+                self.b.manage_open_trades(T0 + 3700)
+        pend = t["pending_exit"]
+        tk = t["tick"]
+        self.assertAlmostEqual(pend["floor"], math.floor(s * 1.001 / tk + 1e-9) * tk)
+        self.assertAlmostEqual(pend["guard"], t["entry"] - 0.5 * r0)
+        self.assertAlmostEqual(pend["lim_qty"], self.half)
+        self.assertIn("-> limit exit", self.sent[-1])
+        self.assertEqual(self.ev("LIMIT_EXIT")[0]["filled"], self.half)
+        self.fd.books = {"AUSDT": ([(s, 1e9)], [(round(pend["floor"] + tk, 6), 1e9)])}
+        self.b.manage_open_trades(T0 + 3715)                        # above the floor: waits
+        self.assertIn("pending_exit", t)
+        self.fd.books = {"AUSDT": ([(s, 1e9)], [(pend["floor"], 1e9)])}
+        self.b.manage_open_trades(T0 + 3730)                        # fills at the floor
+        self.assertIsNone(self.b.book("1H RSI SHORT")["open_trade"])
+        row = self.rows()[-1]
+        self.assertEqual((row["exit_reason"], row["exit_type"]), ("TRAIL_STOP", "limit"))
+        left = round(self.q - self.half, 10)
+        self.assertAlmostEqual(float(row["exit_price"]), (self.half * s + left * pend["floor"]) / self.q, places=2)
+        self.assertIn("Exit: limit,", next(m for m in self.sent if m.startswith("TRADE CLOSED")))
+
+    def test_guard_sends_rest_to_market_and_killswitch(self):
+        for case in ("guard", "kill"):
+            with self.subTest(case=case):
+                self.setUp()
+                t, r0 = self.open_short()
+                s = t["stop"]
+                self.fd.books = {"AUSDT": ([(s, 1e9)], [(s, self.half), (round(s * 1.01, 2), 1e9)])}
+                with mock.patch.object(self.bot_mod.time, "sleep", lambda x: None):
+                    self.assertTrue(self.b.start_limit_exit(t, self.res(t)))
+                g = t["pending_exit"]["guard"]
+                self.fd.books = {"AUSDT": ([(g, 1e9)], [(round(g + t["tick"], 6), 1e9)])}
+                if case == "guard":
+                    self.b.manage_open_trades(T0 + 3800)
+                    why = "price back to entry - 0.5R"
+                else:
+                    self.b.close_now(t, "KILLSWITCH")
+                    why = "KILLSWITCH"
+                self.assertIsNone(self.b.book("1H RSI SHORT")["open_trade"])
+                row = self.rows()[-1]
+                self.assertEqual(row["exit_type"], "limit+market")
+                msg = next(m for m in self.sent if m.startswith("TRADE CLOSED"))
+                self.assertIn(f"Exit: limit {self.half:g} + market", msg)
+                self.assertIn(why, msg)
+
+    def test_entry_and_market_exit_lines(self):
+        t, _ = self.open_short()
+        self.assertTrue(any("Entry: limit, 1 order(s)" in m for m in self.sent if "ENTERED" in m))
+        self.b.close_trade(t, {"reason": "BREAKEVEN_STOP", "price": t["entry"], "ts": T0 + 900, "estimated": True})
+        self.assertEqual(self.rows()[-1]["exit_type"], "market")
+        self.assertIn("Exit: market, slippage", next(m for m in self.sent if m.startswith("TRADE CLOSED")))
