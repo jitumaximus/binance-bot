@@ -505,3 +505,28 @@ class RankByVolume(Runner):
         self.fd.add("UPUSDT", 1, 2_000_000, trend(98, 3600, True, T0))
         self.r.tick(T0 + 9)
         self.assertEqual(self.r.prods["UPUSDT"]["vol24h"], 2_000_000)
+
+
+class StartupUniverse(Runner):
+    def test_universe_loaded_after_restart_without_a_scan(self):
+        self.fd.add("AUSDT", 7, 3_000_000, trend(98, 3600, True, T0))
+        self.r.st["last_scan"] = T0                                           # this hour's scan ran before the restart
+        self.r.st["armed_short"] = {"AUSDT": {"rsi": 80.0, "candle": T0 - 3600}}
+        end = T0 + 300
+        cands, sig = find_signal("short", 300, 45, end)
+        self.fd.c5 = {"AUSDT": cands}
+        self.fd.px = {"AUSDT": round(sig["div_open"] * 0.999, 4)}
+        self.r.tick(end + 8)
+        self.assertEqual(self.r.prods["AUSDT"]["vol24h"], 3_000_000)
+        self.assertNotIn(("AUSDT", "1h"), self.fd.calls)                     # no rescan, no 1h candles
+        self.assertEqual(self.b.book("1H RSI SHORT")["open_trade"]["symbol"], "AUSDT")
+
+    def test_failed_load_retried_after_a_minute(self):
+        calls = []
+        self.fd.products = lambda ct: calls.append(1) or []
+        self.r.st["last_scan"] = T0
+        self.r.tick(T0 + 100)
+        self.r.tick(T0 + 130)
+        self.assertEqual(len(calls), 1)
+        self.r.tick(T0 + 161)
+        self.assertEqual(len(calls), 2)

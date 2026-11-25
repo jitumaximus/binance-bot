@@ -316,6 +316,17 @@ class Rsi1h:
                 self.next_scan_try = now + 60
                 log.exception("1H RSI scan failed")
                 return
+        if not self.prods and now >= self.next_scan_try:
+            # after a restart the armed coins come from state.json but the universe (ids, ticks, 24h volumes) is only
+            # in memory: load it now (2 light requests, no candles) instead of skipping every signal as "not in the
+            # universe" until the next hourly scan
+            try:
+                self.prods = self.universe()
+                log.info("1H RSI: universe loaded at start: %d symbols", len(self.prods))
+            except Exception:  # noqa: BLE001
+                log.exception("1H RSI universe load failed")
+            if not self.prods:
+                self.next_scan_try = now + 60
         paused = self.b.state.get("paused")
         for side, per, book in (("short", P5M, SHORT_BOOK), ("long", P15M, LONG_BOOK)):
             bnd = int(now) // per * per
