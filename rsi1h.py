@@ -20,8 +20,9 @@ LONG      15m candles, ~8 s after each 15m close, RSI1H_LONG_WINDOW_MIN (120). F
 ENTRY     market at the start of the next candle (the check ~8 s after the close), only if the last trade price is
           still below the red divergence candle's open (short) / above the green one's open (long); else skipped
           and logged. Paper fill = last trade price, RSI1H_SLIPPAGE_PCT against us (0 = like the POC paper fills),
-          taker fee FEE_PCT_PER_SIDE on both sides (in bot.close_trade). Several coins at once: most extreme 1H RSI
-          first. One open trade per book. 30-minute cooldown (RSI1H_COOLDOWN_MIN) on a coin after a short on it closes.
+          taker fee FEE_PCT_PER_SIDE on both sides (in bot.close_trade). Several coins at once: highest 24h quote
+          volume first (RSI1H_RANK_BY=volume, default since 25 Nov 2026; =rsi: most extreme 1H RSI first); if one is
+          skipped, the next is tried. One open trade per book. 30-minute cooldown (RSI1H_COOLDOWN_MIN) on a coin after a short on it closes.
 STOP      1 tick (STOP_BUFFER_TICKS) beyond the divergence candle's high (short) / low (long), at least
           RSI1H_MIN_STOP_PCT (0.5%) from entry (widened and logged if closer).
 EXIT      no target. At 1R the stop moves to entry; from 3R it trails in whole-R steps 1R behind (3R -> 2R, 4R -> 3R
@@ -48,7 +49,8 @@ N_CANDLES = 98                       # Binance klines: limit < 100 = request wei
 CAND_COLS = ["time", "bot", "book", "symbol", "side", "check", "taken", "reason", "rank",
              "range_low", "range_high", "candle_open", "ltp", "move_pct", "candle_colour", "gap_pct", "beyond_pct",
              "arm_rsi", "ref_time", "ref_price", "ref_rsi", "div_time", "div_price", "div_rsi", "rsi_gap",
-             "div_open", "entry_check", "level", "distance_pct", "stop_candle", "stop_used", "stop_pct", "size"]
+             "div_open", "entry_check", "level", "distance_pct", "stop_candle", "stop_used", "stop_pct", "size",
+             "vol24h_usdt", "rank_by"]   # binance-bot only (appended, so the shared columns line up with fyers')
 
 
 def load_cfg(env=None):
@@ -80,6 +82,9 @@ def load_cfg(env=None):
         "be_r": f("RSI1H_BE_R", 1),
         "trail_start_r": f("RSI1H_TRAIL_START_R", 3),
         "check_delay": f("RSI1H_CHECK_DELAY_SEC", 8),
+        # several divergences at one check: "volume" = highest 24h quote volume first (since 25 Nov 2026),
+        # "rsi" = most extreme 1H RSI first (before)
+        "rank_by": "rsi" if str(e.get("RSI1H_RANK_BY", "volume")).strip().lower() == "rsi" else "volume",
     }
 
 
@@ -180,6 +185,16 @@ def div_trigger(cands, side, window_min, min_gap=2, min_diff=3.0, ema_len=5, rsi
     return {"side": side, "stop_ref": stop_ref, "div_open": d["open"], "div_time": d["time"], "ref_time": p["time"],
             "ref_price": p[key], "div_price": d[key],
             "rsi_ref": ra, "rsi_div": rb, "rsi_gap": rg, "rsi_gap_exact": diff, "between": between, "detail": detail}
+
+
+def rank_signals(sigs, side, rank_by):
+    """Order of entry tries. volume: highest 24h quote volume first (unknown volume last), ties by 1H RSI;
+    rsi: most extreme 1H RSI first (shorts highest, longs lowest)."""
+    def by_rsi(s):
+        return -s["rsi1h"] if side == "short" else s["rsi1h"]
+    if rank_by == "volume":
+        return sorted(sigs, key=lambda s: (-(s.get("vol24h") or 0), by_rsi(s)))
+    return sorted(sigs, key=by_rsi)
 
 
 def round_tick(price, tick, mode):
@@ -288,7 +303,8 @@ class Rsi1h:
                 f"<{c['oversold']:g} long, divergence on 5m ({c['short_window']:g} min) / 15m ({c['long_window']:g} min), "
                 f"RSI gap >= {c['min_rsi_diff']:g} | stop beyond the divergence candle, min {c['min_stop_pct']:g}% | "
                 f"BE {c['be_r']:g}R, trail from {c['trail_start_r']:g}R, no target | risk {c['risk_pct']:g}%, "
-                f"{c['leverage']:g}x isolated | universe: USDT perps with 24h vol >= ${c['min_vol'] / 1e3:,.0f}k, hourly")
+                f"{c['leverage']:g}x isolated | universe: USDT perps with 24h vol >= ${c['min_vol'] / 1e3:,.0f}k, hourly | "
+                f"several signals: {'highest 24h volume' if c['rank_by'] == 'volume' else 'most extreme 1H RSI'} first")
 
     # ---- schedule (called from the bot's main loop every ~2 s) ----
     def tick(self, now):
@@ -325,7 +341,8 @@ class Rsi1h:
                 continue
             m = getattr(data, "meta", {}).get(p["id"], {})
             prods[p["symbol"]] = {"id": p["id"], "symbol": p["symbol"], "tick": float(p["tick_size"]),
-                                  "cv": float(p["contract_value"]), "min_notional": float(m.get("min_notional") or 5)}
+                                  "cv": float(p["contract_value"]), "min_notional": float(m.get("min_notional") or 5),
+                                  "vol24h": float(vol[p["symbol"]])}
         return prods
 
     def scan(self, now, b1):
@@ -395,13 +412,15 @@ class Rsi1h:
                 self.done[side][1].add(sym)
                 sig = div_trigger(cand, side, window, c["min_gap"], c["min_rsi_diff"], c["ema_len"], c["rsi_len"])
                 if sig and sym in armed:
-                    sig.update(symbol=sym, rsi1h=armed[sym]["rsi"])
+                    sig.update(symbol=sym, rsi1h=armed[sym]["rsi"], vol24h=(self.prods.get(sym) or {}).get("vol24h"))
                     sigs.append(sig)
-        sigs.sort(key=lambda s: -s["rsi1h"] if side == "short" else s["rsi1h"])   # most extreme 1H RSI first
+        sigs = rank_signals(sigs, side, c["rank_by"])    # RSI1H_RANK_BY: volume (default) or rsi
         book = SHORT_BOOK if side == "short" else LONG_BOOK
         taken = None
         for rank, sig in enumerate(sigs, 1):
             self.b.event("RSI1H_SIGNAL", book=book, side=side, symbol=sig["symbol"], rsi_1h=sig["rsi1h"],
+                         vol24h_usdt=round(sig["vol24h"]) if sig.get("vol24h") else None, rank=rank,
+                         rank_by=c["rank_by"],
                          rsi_ref=sig["rsi_ref"], rsi_div=sig["rsi_div"], rsi_gap=sig["rsi_gap"],
                          div_candle_open=sig["div_open"], stop_ref=sig["stop_ref"], detail=sig["detail"])
             self.enter(sig, now)
@@ -410,9 +429,9 @@ class Rsi1h:
                 sig["taken"] = True
             elif taken and sig.get("skip_reason", "").startswith("book busy"):
                 sig["skip_reason"] = "ranked lower"
-            self.candidate(sig, book, rank, f"{tf} close", now)
+            self.candidate(sig, book, rank, f"{tf} close", now, c["rank_by"])
 
-    def candidate(self, sig, book, rank, check, now):
+    def candidate(self, sig, book, rank, check, now, rank_by=""):
         """One candidates.csv row. Never raises: a logging problem must not affect trading."""
         try:
             c = sig.get("cand") or {}
@@ -432,7 +451,8 @@ class Rsi1h:
                                    f"{px:g} {'>' if px > sig['div_open'] else '<='} open {sig['div_open']:g}" if px else ""),
                    "stop_candle": c.get("stop_candle"), "stop_used": c.get("stop_used"),
                    "stop_pct": round(c["stop_pct"], 3) if c.get("stop_pct") is not None else None,
-                   "size": c.get("size")}
+                   "size": c.get("size"), "vol24h_usdt": round(sig["vol24h"]) if sig.get("vol24h") else None,
+                   "rank_by": rank_by}
             path = os.path.join(self.b.cfg["data_dir"], "candidates.csv")
             new = not os.path.exists(path)
             with open(path, "a", newline="") as fh:

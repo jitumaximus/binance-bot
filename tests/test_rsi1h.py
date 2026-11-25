@@ -441,3 +441,67 @@ class Candidates(Runner):
         self.b.book("1H RSI SHORT")["open_trade"] = {"symbol": "XUSDT", "product_id": 9, "side": "short"}
         self.r.tick(T0 + 300 + 8)
         self.assertFalse(os.path.exists(os.path.join(self.d, "candidates.csv")))
+
+
+class RankByVolume(Runner):
+    """RSI1H_RANK_BY: volume (default) = highest 24h quote volume first; rsi = most extreme 1H RSI first."""
+    def setup_two(self, px_factor=0.999, vols=(1_000_000, 50_000_000)):
+        end = T0 + 300
+        cands, sig = find_signal("short", 300, 45, end)
+        self.arm("short", [("AUSDT", 75.0), ("BUSDT", 88.0)])                # B has the more extreme RSI
+        self.r.prods["AUSDT"]["vol24h"], self.r.prods["BUSDT"]["vol24h"] = vols
+        self.fd.c5 = {"AUSDT": cands, "BUSDT": cands}
+        px = round(sig["div_open"] * px_factor, 4)
+        self.fd.px = {"AUSDT": px, "BUSDT": px}
+        return end, sig
+
+    def rows(self):
+        with open(os.path.join(self.d, "candidates.csv"), newline="") as fh:
+            return list(csv.DictReader(fh))
+
+    def test_default_is_volume(self):
+        self.assertEqual(R.load_cfg({})["rank_by"], "volume")
+        self.assertEqual(R.load_cfg({"RSI1H_RANK_BY": "rsi"})["rank_by"], "rsi")
+        self.assertEqual(R.load_cfg({"RSI1H_RANK_BY": " RSI "})["rank_by"], "rsi")
+
+    def test_most_liquid_first(self):
+        end, _ = self.setup_two(vols=(90_000_000, 2_000_000))                 # A far more liquid, lower RSI
+        self.r.tick(end + 8)
+        self.assertEqual(self.b.book("1H RSI SHORT")["open_trade"]["symbol"], "AUSDT")
+        a, b = self.rows()
+        self.assertEqual((a["symbol"], a["rank"], a["taken"], a["vol24h_usdt"], a["rank_by"], a["arm_rsi"]),
+                         ("AUSDT", "1", "yes", "90000000", "volume", "75.0"))
+        self.assertEqual((b["symbol"], b["rank"], b["reason"], b["vol24h_usdt"], b["arm_rsi"]),
+                         ("BUSDT", "2", "ranked lower", "2000000", "88.0"))
+        self.assertTrue(a["rsi_gap"] and b["rsi_gap"])
+        s = self.ev("RSI1H_SIGNAL")
+        self.assertEqual([(x["symbol"], x["rank"], x["vol24h_usdt"]) for x in s],
+                         [("AUSDT", 1, 90000000), ("BUSDT", 2, 2000000)])
+
+    def test_rsi_mode_keeps_the_old_order(self):
+        self.r.c["rank_by"] = "rsi"
+        end, _ = self.setup_two(vols=(90_000_000, 2_000_000))
+        self.r.tick(end + 8)
+        self.assertEqual(self.b.book("1H RSI SHORT")["open_trade"]["symbol"], "BUSDT")
+        self.assertEqual([r["rank_by"] for r in self.rows()], ["rsi", "rsi"])
+
+    def test_top_coin_fails_a_check_next_one_is_tried(self):
+        end, sig = self.setup_two(vols=(90_000_000, 2_000_000))
+        self.fd.px["AUSDT"] = sig["div_open"]                                  # A fails the entry check
+        self.r.tick(end + 8)
+        self.assertEqual(self.b.book("1H RSI SHORT")["open_trade"]["symbol"], "BUSDT")
+        a, b = self.rows()
+        self.assertEqual((a["symbol"], a["reason"], b["symbol"], b["taken"]), ("AUSDT", "entry check", "BUSDT", "yes"))
+
+    def test_rank_signals_unknown_volume_last_ties_by_rsi(self):
+        sigs = [{"symbol": "X", "rsi1h": 80, "vol24h": None}, {"symbol": "Y", "rsi1h": 75, "vol24h": 5e6},
+                {"symbol": "Z", "rsi1h": 90, "vol24h": 5e6}]
+        self.assertEqual([s["symbol"] for s in R.rank_signals(sigs, "short", "volume")], ["Z", "Y", "X"])
+        self.assertEqual([s["symbol"] for s in R.rank_signals(sigs, "short", "rsi")], ["Z", "X", "Y"])
+        longs = [{"symbol": "X", "rsi1h": 20, "vol24h": 1e6}, {"symbol": "Y", "rsi1h": 25, "vol24h": 1e6}]
+        self.assertEqual([s["symbol"] for s in R.rank_signals(longs, "long", "volume")], ["X", "Y"])
+
+    def test_universe_carries_24h_volume(self):
+        self.fd.add("UPUSDT", 1, 2_000_000, trend(98, 3600, True, T0))
+        self.r.tick(T0 + 9)
+        self.assertEqual(self.r.prods["UPUSDT"]["vol24h"], 2_000_000)
