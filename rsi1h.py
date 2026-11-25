@@ -22,12 +22,14 @@ ENTRY     market at the start of the next candle (the check ~8 s after the close
           and logged. Paper fill = last trade price, RSI1H_SLIPPAGE_PCT against us (0 = like the POC paper fills),
           taker fee FEE_PCT_PER_SIDE on both sides (in bot.close_trade). Several coins at once: highest 24h quote
           volume first (RSI1H_RANK_BY=volume, default since 25 Nov 2026; =rsi: most extreme 1H RSI first); if one is
-          skipped, the next is tried. One open trade per book. 30-minute cooldown (RSI1H_COOLDOWN_MIN) on a coin after a short on it closes.
+          skipped, the next is tried. Parallel trades (26 Nov 2026): every signal is taken while the
+          book has free margin (balance - margin of its open trades); a coin is never held twice. 30-minute cooldown (RSI1H_COOLDOWN_MIN) on a coin after a short on it closes.
 STOP      1 tick (STOP_BUFFER_TICKS) beyond the divergence candle's high (short) / low (long), at least
           RSI1H_MIN_STOP_PCT (0.5%) from entry (widened and logged if closer).
 EXIT      no target. At 1R the stop moves to entry; from 3R it trails in whole-R steps 1R behind (3R -> 2R, 4R -> 3R
           ...). Exit only on that stop (paper: checked on 1-minute candles, like POC).
-SIZE      RSI1H_RISK_PCT (5%) of the book at the stop, notional capped at RSI1H_LEVERAGE (20x isolated) x the book,
+SIZE      RSI1H_RISK_PCT (5%) of the book at the stop, notional capped at RSI1H_LEVERAGE (20x isolated) x the book's
+          free margin (the whole book when nothing is open),
           rounded down to the symbol's step; skipped and logged when Binance's min notional can't be met within that.
 """
 import csv
@@ -219,23 +221,27 @@ def stop_for(side, stop_ref, entry, tick, buffer_ticks, min_pct):
     return (need, candle, True) if candle > need else (candle, candle, False)
 
 
-def size_for(balance, risk_pct, leverage, entry, stop, step, min_notional):
-    """Contracts (x step = quantity) risking risk_pct of the balance at the stop, notional <= leverage x balance.
+def size_for(balance, risk_pct, leverage, entry, stop, step, min_notional, free=None):
+    """Contracts (x step = quantity) risking risk_pct of the balance at the stop, notional <= leverage x the free
+    margin (free = balance minus the margin of the book's open trades; None = the whole balance).
     Returns (contracts, info); contracts 0 with info["skip"] when it can't be done."""
     dist = abs(entry - stop)
     if entry <= 0 or dist <= 0 or step <= 0 or balance <= 0:
         return 0, {"skip": "invalid entry/stop/step/balance"}
+    room = balance if free is None else max(0.0, min(balance, free))
     budget = balance * risk_pct / 100.0
     by_risk = math.floor(budget / (dist * step) + 1e-9)
-    by_lev = math.floor(balance * leverage / (entry * step) + 1e-9)
+    by_lev = math.floor(room * leverage / (entry * step) + 1e-9)
     n = max(0, min(by_risk, by_lev))
-    info = {"risk_budget": round(budget, 4), "by_risk": by_risk, "by_leverage": by_lev,
-            "binding": "leverage cap" if by_lev < by_risk else "risk budget"}
+    info = {"risk_budget": round(budget, 4), "by_risk": by_risk, "by_leverage": by_lev, "free_margin": round(room, 4),
+            "binding": ("free margin" if room < balance - 1e-9 else "leverage cap") if by_lev < by_risk else "risk budget"}
     min_n = math.ceil(min_notional / (entry * step) - 1e-9)
     if n < max(1, min_n):
         need = max(1, min_n)
         info["skip"] = (f"min notional ${min_notional:g} needs {need * step:g} units = ${need * step * dist:.2f} risk "
                         f"(> {risk_pct:g}% = ${budget:.2f})" if need * step * dist > budget + 1e-12 else
+                        f"no free margin: ${room:.2f} free x {leverage:g}x < min notional ${min_notional:g}"
+                        if room < balance - 1e-9 else
                         f"min notional ${min_notional:g} exceeds the {leverage:g}x leverage cap")
         return 0, info
     info.update(notional=n * step * entry, risk_usd=n * step * dist, margin=n * step * entry / leverage)
@@ -341,7 +347,7 @@ class Rsi1h:
         for side, per, book in (("short", P5M, SHORT_BOOK), ("long", P15M, LONG_BOOK)):
             bnd = int(now) // per * per
             armed = self.st["armed_" + side]
-            if (armed and not paused and self.b.book_free(book) and bnd + self.c["check_delay"] <= now <= bnd + 60
+            if (armed and not paused and self.has_room(book) and bnd + self.c["check_delay"] <= now <= bnd + 60
                     and now - self.last_try[side] >= 3):
                 if self.done[side][0] != bnd:
                     self.done[side] = (bnd, set())
@@ -349,6 +355,10 @@ class Rsi1h:
                 if pend:
                     self.last_try[side] = now
                     self.evaluate(now, bnd, side, pend)
+
+    def has_room(self, book):
+        """Parallel trades (26 Nov 2026): a book may open another trade while it has free margin left."""
+        return self.b.free_margin(book) > 1e-6
 
     # ---- hourly universe + arming ----
     def universe(self):
@@ -437,19 +447,13 @@ class Rsi1h:
                     sigs.append(sig)
         sigs = rank_signals(sigs, side, c["rank_by"])    # RSI1H_RANK_BY: volume (default) or rsi
         book = SHORT_BOOK if side == "short" else LONG_BOOK
-        taken = None
         for rank, sig in enumerate(sigs, 1):
             self.b.event("RSI1H_SIGNAL", book=book, side=side, symbol=sig["symbol"], rsi_1h=sig["rsi1h"],
                          vol24h_usdt=round(sig["vol24h"]) if sig.get("vol24h") else None, rank=rank,
                          rank_by=c["rank_by"],
                          rsi_ref=sig["rsi_ref"], rsi_div=sig["rsi_div"], rsi_gap=sig["rsi_gap"],
                          div_candle_open=sig["div_open"], stop_ref=sig["stop_ref"], detail=sig["detail"])
-            self.enter(sig, now)
-            if "skip_reason" not in sig and not self.b.book_free(book):
-                taken = sig["symbol"]
-                sig["taken"] = True
-            elif taken and sig.get("skip_reason", "").startswith("book busy"):
-                sig["skip_reason"] = "ranked lower"
+            self.enter(sig, now)                 # parallel trades: every signal is tried while margin is free
             self.candidate(sig, book, rank, f"{tf} close", now, c["rank_by"])
 
     def candidate(self, sig, book, rank, check, now, rank_by=""):
@@ -490,7 +494,7 @@ class Rsi1h:
             log.warning("candidates.csv: %s", ex)
 
     def skip(self, sig, book, reason, short=None):
-        """short: the reason as written in candidates.csv (book busy, cooldown, entry check, size, ...)."""
+        """short: the reason as written in candidates.csv (no free margin, already held, cooldown, entry check, size, ...)."""
         sig["skip_reason"] = short or reason
         self.b.event("RSI1H_SKIP", book=book, side=sig["side"], symbol=sig["symbol"], reason=reason,
                      rsi_1h=sig["rsi1h"], rsi_gap=sig["rsi_gap"])
@@ -507,12 +511,15 @@ class Rsi1h:
         cand = sig.setdefault("cand", {})          # numbers for candidates.csv
         if b.state.get("paused"):
             return self.skip(sig, book, "bot is paused", "paused")
-        if not b.book_free(book):
-            return self.skip(sig, book, f"{book} already has a trade open", "book busy")
+        if not self.has_room(book):
+            return self.skip(sig, book, f"{book} has no free margin left (balance ${b.book(book)['balance']:.2f}, "
+                                        f"{len(b.book_trades(book))} trade(s) open)", "no free margin")
         if p is None:
             return self.skip(sig, book, "not in the universe any more", "not in universe")
-        if any(t["product_id"] == p["id"] for _, t in b.open_trades()):
-            return self.skip(sig, book, "this coin is already held by another book", "held by another book")
+        held = [n for n, t in b.open_trades() if t["product_id"] == p["id"]]
+        if held:
+            return self.skip(sig, book, f"this coin is already held by {held[0]}",
+                             "already held" if held[0] == book else "held by another book")
         last = self.st["cooldown"].get(sym)
         if side == "short" and last and now - last < c["cooldown_min"] * 60:
             return self.skip(sig, book, f"cooldown: last {sym} short closed {(now - last) / 60:.0f} min ago "
@@ -545,9 +552,13 @@ class Rsi1h:
         if (side == "short" and stop <= entry) or (side == "long" and (stop >= entry or stop <= 0)):
             return self.skip(sig, book, "entry is already beyond the stop", "price past stop")
         equity = b.book(book)["balance"]
-        n, info = size_for(equity, c["risk_pct"], c["leverage"], entry, stop, p["cv"], p["min_notional"])
+        free = b.free_margin(book)
+        n, info = size_for(equity, c["risk_pct"], c["leverage"], entry, stop, p["cv"], p["min_notional"], free)
+        cand["free_margin"] = round(free, 4)
         if n < 1:
-            return self.skip(sig, book, f"size: {info.get('skip')}", "size (min notional)")
+            return self.skip(sig, book, f"size: {info.get('skip')}",
+                             "no free margin" if str(info.get("skip", "")).startswith("no free margin")
+                             else "size (min notional)")
         cand["size"] = n * p["cv"]
         tx = {"side": side, "symbol": sym, "product_id": p["id"], "contracts": n, "cv": p["cv"], "tick": p["tick"]}
         why = b.capped_entry(tx, p["min_notional"], ob)
@@ -587,6 +598,7 @@ class Rsi1h:
              # exits: no target, BE at 1R, whole-R trail from 3R (read per trade by bot.check_exit_by_candles)
              "trail": True, "trail_r": 0, "stop_set": True, "touch_close": 0, "tc_low": entry, "tc_high": entry,
              "be_r": c["be_r"], "trail_start_r": c["trail_start_r"]}
+        sig["taken"] = True
         b.finish_entry(t, info, now)
 
     # ---- hooks called from bot.close_trade ----

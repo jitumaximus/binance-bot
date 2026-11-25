@@ -263,7 +263,7 @@ def make_cfg():
         # capped IOC limit children instead of a market order (paper: simulated on the live /fapi/v1/depth instead of
         # filling at the last price); size capped at LIQ_CAP_PCT_OF_DEPTH of the top-5 levels on our side.
         "entry_slip_cap_pct": f("ENTRY_SLIP_CAP_PCT", 0.001),
-        "liq_cap_pct": f("LIQ_CAP_PCT_OF_DEPTH", 0.20),
+        "liq_cap_pct": f("LIQ_CAP_PCT_OF_DEPTH", 0.30),   # 0.20 until 26 Nov 2026
         "entry_max_children": i("ENTRY_MAX_CHILDREN", 20),
         # limit exits (26 Nov 2026, 1H RSI books, paper): a TRAIL_STOP whose market exit would slip more than
         # EXIT_SLIP_CAP_PCT on the live depth exits with limit children down to the trail stop - that %; the rest
@@ -1193,7 +1193,38 @@ class Bot:
         return self.state["books"][name]
 
     def open_trades(self):
-        return [(n, b["open_trade"]) for n, b in self.state["books"].items() if b["open_trade"]]
+        """Every open trade: each book's open_trade, plus the 1H RSI books' parallel trades (more_trades, since
+        26 Nov 2026; open_trade is the oldest one, so older readers of state.json still see a position)."""
+        return [(n, t) for n, b in self.state["books"].items()
+                for t in ([b["open_trade"]] if b["open_trade"] else []) + list(b.get("more_trades") or [])]
+
+    def book_trades(self, name):
+        b = self.book(name)
+        return ([b["open_trade"]] if b["open_trade"] else []) + list(b.get("more_trades") or [])
+
+    def free_margin(self, name):
+        """1H RSI books: the book's balance minus the margin of its open trades (what a new parallel trade may use)."""
+        return self.book(name)["balance"] - sum(t.get("margin") or 0.0 for t in self.book_trades(name))
+
+    def add_trade(self, name, t):
+        b = self.book(name)
+        if b["open_trade"] is None:
+            b["open_trade"] = t
+        else:
+            b.setdefault("more_trades", []).append(t)
+
+    def drop_trade(self, name, t):
+        """Remove t from its book; the oldest parallel trade moves up into open_trade."""
+        b = self.book(name)
+        more = list(b.get("more_trades") or [])
+        if b["open_trade"] is t or (b["open_trade"] or {}).get("opened_ts") == t.get("opened_ts") and \
+                (b["open_trade"] or {}).get("symbol") == t.get("symbol"):
+            b["open_trade"] = more.pop(0) if more else None
+        else:
+            more = [x for x in more if not (x is t or (x.get("symbol") == t.get("symbol")
+                                                       and x.get("opened_ts") == t.get("opened_ts")))]
+        if "more_trades" in b or more:
+            b["more_trades"] = more
 
     def book_free(self, name):
         return self.book(name)["open_trade"] is None
@@ -2321,7 +2352,7 @@ class Bot:
         t["risk_usd"] = t["contracts"] * t["cv"] * abs(t["stop"] - t["entry"])
         t["orig_stop"], t["risk0"], t["be_moved"] = t["stop"], abs(t["stop"] - t["entry"]), False
         t["notional"] = t["contracts"] * t["cv"] * t["entry"]
-        self.book(bk)["open_trade"] = t
+        self.add_trade(bk, t)
         self.save_state()
         self.event("ENTRY", book=bk, side=tside(t), symbol=t["symbol"], mode=c["mode"], entry=t["entry"], stop_loss=t["stop"],
                    take_profit=t["tp"], contracts=t["contracts"], risk_usd=round(t["risk_usd"], 2),
@@ -2341,6 +2372,7 @@ class Bot:
                 f"Size: {t['contracts'] * t['cv']:g} (~${t['notional']:.0f} notional), {t['leverage']:g}x isolated, "
                 f"margin ${t['margin']:.2f}\n"
                 f"Risk: ${t['risk_usd']:.2f} ({t['risk_usd'] / eq * 100:.2f}% of {bk}'s ${eq:.2f})\n"
+                f"{bk}: {len(self.book_trades(bk))} trade(s) open, free margin ${self.free_margin(bk):.2f}\n"
                 f"1H RSI {t['rsi']} | {x['detail']}\nNo real order placed (paper mode).")
             return
         stop_label = (f"{c['margin_stop_pct']:g}%-of-margin stop" if t.get("stop_source") == "margin"
@@ -2701,7 +2733,7 @@ class Bot:
         book["balance"] = round(book["balance"] + net, 4)
         book["trades"] += 1
         book["wins"] += int(net > 0)
-        book["open_trade"] = None
+        self.drop_trade(bk, t)
         self.save_state()
         fmt = lambda x: fmt_price(x, t["tick"])  # noqa: E731
         xx = self.exit_exec(t, res)
@@ -2759,13 +2791,15 @@ class Bot:
         for n in self.book_names():
             b = self.book(n)
             d = b["day"].get(dk, {})
-            t = b["open_trade"]
+            trades = self.book_trades(n)
             tag = (" (paused)" if n in self.paused_books() else "") if n in self.enabled_books() else " (off)"
             lines.append(f"\n{n}{tag}: ${b['balance']:.2f} "
-                         f"(start ${b['start']:.2f}) | today {d.get('trades', 0)} trades, ${d.get('pnl', 0):+.2f}")
-            lines.append(f"  {tside(t).upper()} {t['symbol']} x{t['contracts']} entry {fmt_price(t['entry'], t['tick'])} "
-                         f"SL {fmt_price(t['stop'], t['tick'])}{' (at entry)' if t.get('be_moved') else ''} "
-                         f"TP {fmt_price(t['tp'], t['tick']) if t.get('tp') else 'none (trailing)'}" if t else "  no position")
+                         f"(start ${b['start']:.2f}) | today {d.get('trades', 0)} trades, ${d.get('pnl', 0):+.2f}"
+                         + (f" | {len(trades)} open, free margin ${self.free_margin(n):.2f}" if len(trades) > 1 else ""))
+            lines += [f"  {tside(t).upper()} {t['symbol']} x{t['contracts']} entry {fmt_price(t['entry'], t['tick'])} "
+                      f"SL {fmt_price(t['stop'], t['tick'])}{' (at entry)' if t.get('be_moved') else ''} "
+                      f"TP {fmt_price(t['tp'], t['tick']) if t.get('tp') else 'none (trailing)'}" for t in trades] \
+                or ["  no position"]
         lines.append("")
         lines.append(self.wallet_line().strip() or "")
         lines.append(f"Short setups armed: {len(st['armed'])}")

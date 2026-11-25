@@ -2,6 +2,7 @@
 Run: venv/bin/python -m unittest discover -s tests -v   (no network: a fake Binance data client)"""
 import csv
 import math
+import json
 import os
 import random
 import sys
@@ -305,7 +306,8 @@ class Runner(unittest.TestCase):
         self.assertEqual((t["symbol"], t["side"], t["strategy"], t["tp"], t["trail"], t["be_r"], t["trail_start_r"]),
                          ("BUSDT", "short", "rsi1h", None, True, 1, 3))
         self.assertEqual(t["entry"], px)                                     # slippage 0 (like POC paper)
-        self.assertEqual(self.ev("RSI1H_SKIP")[-1]["reason"], "1H RSI SHORT already has a trade open")
+        # parallel trades: AUSDT is taken too (margin left after BUSDT)
+        self.assertEqual([x["symbol"] for x in self.b.book("1H RSI SHORT")["more_trades"]], ["AUSDT"])
         risk = abs(t["stop"] - t["entry"])
         self.assertGreaterEqual(risk / t["entry"] * 100, 0.5 - 1e-9)
         self.assertLessEqual(t["risk_usd"], 5.0 + 1e-9)
@@ -328,7 +330,8 @@ class Runner(unittest.TestCase):
         self.assertEqual(res["reason"], "TRAIL_STOP")
         self.assertAlmostEqual(res["price"], R.round_tick(e0 - 3 * r0, 0.0001, "down"), places=6)
         self.b.close_trade(t, res)
-        self.assertIsNone(self.b.book("1H RSI SHORT")["open_trade"])
+        bk = self.b.book("1H RSI SHORT")
+        self.assertEqual((bk["open_trade"]["symbol"], bk["more_trades"]), ("AUSDT", []))   # the next one moves up
         x = self.ev("EXIT")[-1]
         fees = 0.05 / 100 * t["contracts"] * t["cv"] * (e0 + res["price"])
         self.assertAlmostEqual(x["est_fees_usd"], round(fees, 4))           # taker fee both sides
@@ -348,7 +351,7 @@ class Runner(unittest.TestCase):
         self.r.st["armed_short"] = {"BUSDT": {"rsi": 80.0, "candle": T0}}
         self.r.tick(end2 + 8)
         self.assertIn("cooldown", self.ev("RSI1H_SKIP")[-1]["reason"])
-        self.assertIsNone(self.b.book("1H RSI SHORT")["open_trade"])
+        self.assertEqual([t["symbol"] for t in self.b.book_trades("1H RSI SHORT")], ["AUSDT"])   # still open
 
     def test_short_skipped_when_price_not_below_red_open(self):
         end = T0 + 300
@@ -374,9 +377,10 @@ class Runner(unittest.TestCase):
         self.assertLess(t["stop"], t["entry"])
         self.assertTrue(all(res in ("15m", "1m", "depth") for _, res in self.fd.calls))
 
-    def test_no_candle_fetch_while_book_busy(self):
+    def test_no_candle_fetch_without_free_margin(self):
         self.arm("short", [("AUSDT", 75.0)])
-        self.b.book("1H RSI SHORT")["open_trade"] = {"symbol": "XUSDT", "product_id": 9, "side": "short"}
+        bal = self.b.book("1H RSI SHORT")["balance"]
+        self.b.book("1H RSI SHORT")["open_trade"] = {"symbol": "XUSDT", "product_id": 9, "side": "short", "margin": bal}
         self.r.tick(T0 + 300 + 8)
         self.assertEqual(self.fd.calls, [])
 
@@ -421,7 +425,7 @@ class Candidates(Runner):
         self.r.tick(end + 8)
         b, a = self.rows()
         self.assertEqual((b["symbol"], b["taken"], b["rank"], b["reason"], b["check"]), ("BUSDT", "yes", "1", "", "5m close"))
-        self.assertEqual((a["symbol"], a["taken"], a["rank"], a["reason"]), ("AUSDT", "no", "2", "ranked lower"))
+        self.assertEqual((a["symbol"], a["taken"], a["rank"], a["reason"]), ("AUSDT", "yes", "2", ""))   # parallel
         t = self.b.book("1H RSI SHORT")["open_trade"]
         self.assertEqual((b["bot"], b["book"], b["side"], float(b["arm_rsi"])), ("binance-bot", "1H RSI SHORT", "SHORT", 88.0))
         self.assertEqual((float(b["rsi_gap"]), float(b["ref_rsi"]), float(b["div_rsi"])),
@@ -432,7 +436,7 @@ class Candidates(Runner):
         self.assertEqual((float(b["ltp"]), float(b["stop_used"])), (px, t["stop"]))
         self.assertAlmostEqual(float(b["size"]), t["contracts"] * t["cv"])
         self.assertEqual(b["entry_check"], f"{px:g} < open {sig['div_open']:g}")
-        self.assertEqual(a["ltp"], "")                                         # ranked lower: no price lookup
+        self.assertEqual(float(a["ltp"]), px)
         self.assertEqual(len([c for c in self.fd.calls[n_before:] if c[1] == "5m"]), 2)  # no extra candle calls
 
     def test_entry_check_and_cooldown_reasons(self):
@@ -482,8 +486,8 @@ class RankByVolume(Runner):
         a, b = self.rows()
         self.assertEqual((a["symbol"], a["rank"], a["taken"], a["vol24h_usdt"], a["rank_by"], a["arm_rsi"]),
                          ("AUSDT", "1", "yes", "90000000", "volume", "75.0"))
-        self.assertEqual((b["symbol"], b["rank"], b["reason"], b["vol24h_usdt"], b["arm_rsi"]),
-                         ("BUSDT", "2", "ranked lower", "2000000", "88.0"))
+        self.assertEqual((b["symbol"], b["rank"], b["taken"], b["vol24h_usdt"], b["arm_rsi"]),
+                         ("BUSDT", "2", "yes", "2000000", "88.0"))                # parallel: taken too
         self.assertTrue(a["rsi_gap"] and b["rsi_gap"])
         s = self.ev("RSI1H_SIGNAL")
         self.assertEqual([(x["symbol"], x["rank"], x["vol24h_usdt"]) for x in s],
@@ -585,10 +589,10 @@ class Execution(Runner):
         self.assertEqual(tr["exit_ref"], f"{px * 1.0001}")                              # a short exit buys the ask
 
     def test_liquidity_cap_cuts_the_size(self):
-        px, row = self.go(lambda px: [(px, 2.0)] * 5)            # 20% of 10 coins = 2 coins
+        px, row = self.go(lambda px: [(px, 6.0)] + [(round(px * 0.95, 4), 1.0)] * 4)   # 30% (26 Nov 2026) of 10 = 3
         t = self.b.book("1H RSI SHORT")["open_trade"]
-        self.assertAlmostEqual(t["contracts"] * t["cv"], 2.0)
-        self.assertEqual((row["liq_capped"], row["liq_cap_qty"], float(row["qty_intended"])), ("yes", "2.0", 2.0))
+        self.assertAlmostEqual(t["contracts"] * t["cv"], 3.0)
+        self.assertEqual((row["liq_capped"], row["liq_cap_qty"], float(row["qty_intended"])), ("yes", "3.0", 3.0))
 
 
 class LimitExits(Runner):
@@ -674,3 +678,79 @@ class LimitExits(Runner):
         self.b.close_trade(t, {"reason": "BREAKEVEN_STOP", "price": t["entry"], "ts": T0 + 900, "estimated": True})
         self.assertEqual(self.rows()[-1]["exit_type"], "market")
         self.assertIn("Exit: market, slippage", next(m for m in self.sent if m.startswith("TRADE CLOSED")))
+
+
+class ParallelTrades(Runner):
+    """26 Nov 2026: a 1H RSI book takes every signal while it has free margin (balance - margin of open trades)."""
+    def sig_for(self, syms, end=T0 + 300):
+        cands, sig = find_signal("short", 300, 45, end)
+        self.arm("short", [(s, 80.0 - i) for i, s in enumerate(syms)])
+        self.fd.c5 = {s: cands for s in syms}
+        px = round(sig["div_open"] * 0.999, 4)
+        self.fd.px = {s: px for s in syms}
+        return end, px
+
+    def rows(self):
+        with open(os.path.join(self.d, "candidates.csv"), newline="") as fh:
+            return list(csv.DictReader(fh))
+
+    def test_takes_trades_until_margin_runs_out(self):
+        end, px = self.sig_for(["AUSDT", "BUSDT", "CUSDT", "DUSDT"])
+        bk = self.b.book("1H RSI SHORT")
+        self.r.tick(end + 8)
+        trades = self.b.book_trades("1H RSI SHORT")
+        self.assertGreaterEqual(len(trades), 2)
+        used = sum(t["margin"] for t in trades)
+        self.assertLessEqual(used, bk["balance"] + 1e-9)                    # never more margin than the balance
+        for t in trades:                                                    # risk per trade: 5% of the balance
+            self.assertLessEqual(t["risk_usd"], 0.05 * bk["balance"] + 1e-9)
+        rows = self.rows()
+        taken = [r["symbol"] for r in rows if r["taken"] == "yes"]
+        self.assertEqual(taken, [t["symbol"] for t in trades])
+        skipped = [r for r in rows if r["taken"] == "no"]
+        self.assertTrue(all(r["reason"] == "no free margin" for r in skipped))
+        self.assertEqual(len(taken) + len(skipped), 4)
+        self.assertAlmostEqual(self.b.free_margin("1H RSI SHORT"), bk["balance"] - used)
+        st = self.b.status_text()
+        self.assertIn(f"{len(trades)} open, free margin", st)
+        for t in trades:
+            self.assertIn(t["symbol"], st)
+
+    def test_last_trade_sized_to_the_free_margin(self):
+        end, px = self.sig_for(["AUSDT"])
+        bk = self.b.book("1H RSI SHORT")
+        bk["open_trade"] = {"symbol": "XUSDT", "product_id": 99, "side": "short", "margin": bk["balance"] * 0.9}
+        self.r.tick(end + 8)
+        t = self.b.book_trades("1H RSI SHORT")[-1]
+        self.assertEqual(t["symbol"], "AUSDT")
+        self.assertLessEqual(t["margin"], bk["balance"] * 0.1 + 1e-6)
+        self.assertLess(t["risk_usd"], 0.05 * bk["balance"])               # smaller than a full-risk trade
+
+    def test_same_coin_not_twice(self):
+        end, px = self.sig_for(["AUSDT"])
+        self.r.tick(end + 8)
+        n = len(self.b.book_trades("1H RSI SHORT"))
+        self.r.done["short"] = (0, set())
+        self.r.tick(end + 12)
+        self.assertEqual(len(self.b.book_trades("1H RSI SHORT")), n)
+        self.assertEqual(self.rows()[-1]["reason"], "already held")
+
+    def test_close_middle_trade_and_restart(self):
+        end, px = self.sig_for(["AUSDT", "BUSDT", "CUSDT"])
+        bk = self.b.book("1H RSI SHORT")
+        self.r.c["risk_pct"] = 1                                             # 10% margin each: all three fit
+        self.r.tick(end + 8)
+        syms = [t["symbol"] for t in self.b.book_trades("1H RSI SHORT")]
+        self.assertEqual(len(syms), 3)
+        mid = self.b.book_trades("1H RSI SHORT")[1]
+        self.b.close_trade(mid, {"reason": "STOP_LOSS", "price": mid["stop"], "ts": end + 900, "estimated": True})
+        self.assertEqual([t["symbol"] for t in self.b.book_trades("1H RSI SHORT")], [syms[0], syms[2]])
+        self.b.save_state()
+        with open(os.path.join(self.d, "state.json")) as fh:
+            st = json.load(fh)
+        self.assertEqual(st["books"]["1H RSI SHORT"]["open_trade"]["symbol"], syms[0])
+        self.assertEqual([t["symbol"] for t in st["books"]["1H RSI SHORT"]["more_trades"]], [syms[2]])
+        first = self.b.book_trades("1H RSI SHORT")[0]
+        self.b.close_trade(first, {"reason": "STOP_LOSS", "price": first["stop"], "ts": end + 960, "estimated": True})
+        self.assertEqual((bk["open_trade"]["symbol"], bk["more_trades"]), (syms[2], []))
+        self.assertEqual([n for n, _ in self.b.open_trades()], ["1H RSI SHORT"])
