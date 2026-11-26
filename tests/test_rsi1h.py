@@ -146,20 +146,47 @@ class StopAndSize(unittest.TestCase):
         self.assertEqual((round(stop, 2), round(candle, 2), widened), (99.5, 99.79, True))
         self.assertEqual(R.stop_for("long", 98.0, 100.0, 0.01, 1, 0.5)[2], False)
 
-    def test_size_5pct_risk_20x_cap(self):
-        n, info = R.size_for(100, 5, 20, 100.0, 101.0, 0.01, 5)         # $5 / $1 = 5 units = 500 steps
-        self.assertEqual((n, info["binding"]), (500, "risk budget"))
-        self.assertAlmostEqual(info["risk_usd"], 5.0)
-        self.assertAlmostEqual(info["margin"], 500 * 0.01 * 100 / 20)
-        n, info = R.size_for(100, 5, 20, 100.0, 100.1, 0.01, 5)         # 0.1%: 50 units but cap 20 units
-        self.assertEqual((n, info["binding"]), (2000, "leverage cap"))
-        self.assertAlmostEqual(info["notional"], 2000.0)
+    def test_size_free_margin_x20_or_impact_limit(self):
+        n, info = R.size_for(100, 20, 100.0, 0.01, 5, 1e9)              # deep book: $100 x 20 = $2000 = 20 coins
+        self.assertEqual((n, info["binding"], info["target_qty"]), (2000, "free margin", 20.0))
+        self.assertAlmostEqual(info["margin"], 100.0)
+        n, info = R.size_for(100, 20, 100.0, 0.01, 5, 3.456)            # impact limit 3.456 coins -> 3.45
+        self.assertEqual((n, info["binding"], info["impact_qty"]), (345, "price impact", 3.45))
+        self.assertAlmostEqual(info["margin"], 3.45 * 100 / 20)
+        n, info = R.size_for(40, 20, 100.0, 0.01, 5, 1e9)               # sized from the free margin left
+        self.assertEqual(n, 800)
 
     def test_min_notional_skip(self):
-        n, info = R.size_for(100, 5, 20, 100.0, 120.0, 1, 100)           # step 1 = $100 min, risks $20 > $5
-        self.assertEqual(n, 0)
+        n, info = R.size_for(100, 20, 100.0, 1, 100, 0.5)               # impact 0.5 coin = $50 < $100 min
+        self.assertEqual((n, info["short"]), (0, "too little liquidity"))
         self.assertIn("min notional $100", info["skip"])
-        self.assertIn("> 5% = $5.00", info["skip"])
+        n, info = R.size_for(0.2, 20, 100.0, 0.01, 5, 1e9)              # $0.20 x 20 = $4 < $5
+        self.assertEqual((n, info["short"]), (0, "no free margin"))
+
+    def test_impact_limit_walks_the_book(self):
+        bids = [(100.0, 2.0), (99.97, 2.0), (99.9, 10.0)]               # band 0.05% = 0.05
+        # 100: room 0.05 x 2 = 0.1; 99.97: 0.03 off, 0.02 inside the band -> room += 0.02 x 2 -> 0.14;
+        # 99.9: 0.05 over -> 0.14 / 0.05 = 2.8 more -> 6.8 coins, average exactly 99.95
+        q = R.impact_limit(bids, 0.01, 0.0005)
+        self.assertAlmostEqual(q, 6.8)
+        cost = 2 * 100 + 2 * 99.97 + 2.8 * 99.9
+        self.assertAlmostEqual(cost / q, 99.95)
+        asks = [(100.0, 1.0), (100.2, 50.0)]                             # 0.15 over: 0.05 / 0.15 = 0.333
+        self.assertAlmostEqual(R.impact_limit(asks, 0.01, 0.0005), 1.33)
+        self.assertEqual(R.impact_limit([], 0.01, 0.0005), 0.0)
+        self.assertAlmostEqual(R.impact_limit([(100.0, 5.0), (100.01, 5.0)], 0.01, 0.0005), 10.0)   # all inside
+
+    def test_liquidation_hard_stop_and_loss(self):
+        self.assertAlmostEqual(R.liq_price("long", 100.0, 20, 0.01), 100 * 0.95 / 0.99)     # ~4.04% below
+        self.assertAlmostEqual(R.liq_price("short", 100.0, 20, 0.01), 100 * 1.05 / 1.01)    # ~3.96% above
+        self.assertAlmostEqual(R.hard_stop_for("short", 100.0, 0.01, 0.03), 103.0)
+        self.assertAlmostEqual(R.hard_stop_for("long", 100.0, 0.01, 0.03), 97.0)
+        self.assertEqual(R.active_stop("short", 101.0, 103.0), (101.0, "candle"))
+        self.assertEqual(R.active_stop("short", 103.5, 103.0), (103.0, "hard"))
+        self.assertEqual(R.active_stop("long", 96.0, 97.0), (97.0, "hard"))
+        usd, pct = R.loss_if_stopped("short", 20.0, 100.0, 101.0, 0.05, 100.0)
+        self.assertAlmostEqual(usd, 20 * 1 + 0.0005 * 20 * 201)                             # $22.01
+        self.assertAlmostEqual(pct, usd)
 
 
 # ---------------- runner with a fake Binance data client ----------------
@@ -189,13 +216,15 @@ class FakeData:
     def request(self, method, path, params=None):
         return {"price": str(self.px[params["symbol"]])}
 
-    def orderbook(self, sym, depth=100):   # deep book at the last price: the capped IOC entry fills there
+    depth_qty = 0.5    # coins per level: 5 levels inside 0.05% = 2.5 coins (~$250, 1/8 of a $100 book x 20)
+
+    def orderbook(self, sym, depth=100):   # book at the last price: the capped IOC entry fills there
         self.calls.append((sym, "depth"))
         if sym in getattr(self, "books", {}):
             return self.books[sym]
-        px = self.px.get(sym, 1.0)
-        return [(px, 1e9)] + [(px * (1 - k * 1e-4), 1e9) for k in range(1, 5)], \
-            [(px, 1e9)] + [(px * (1 + k * 1e-4), 1e9) for k in range(1, 5)]
+        px, q = self.px.get(sym, 1.0), self.depth_qty
+        return [(px, q)] + [(px * (1 - k * 1e-4), q) for k in range(1, 5)], \
+            [(px, q)] + [(px * (1 + k * 1e-4), q) for k in range(1, 5)]
 
     def ticker(self, sym):
         return {"mark_price": self.px.get(sym, 0)}
@@ -226,6 +255,9 @@ class Runner(unittest.TestCase):
     def setUp(self):
         import bot
         self.bot_mod = bot
+        sl = mock.patch.object(bot.time, "sleep", lambda x: None)     # IOC children wait 1 s each: not in tests
+        sl.start()
+        self.addCleanup(sl.stop)
         self.d = tempfile.mkdtemp()
         saved = {k: os.environ.get(k) for k in ("EXCHANGE", "DRY_RUN", "RSI1H_ENABLED", "ENABLE_POC")}
         os.environ.update(EXCHANGE="binance", DRY_RUN="1", RSI1H_ENABLED="1", ENABLE_POC="1")
@@ -305,18 +337,27 @@ class Runner(unittest.TestCase):
         t = self.b.book("1H RSI SHORT")["open_trade"]
         self.assertEqual((t["symbol"], t["side"], t["strategy"], t["tp"], t["trail"], t["be_r"], t["trail_start_r"]),
                          ("BUSDT", "short", "rsi1h", None, True, 1, 3))
-        self.assertEqual(t["entry"], px)                                     # slippage 0 (like POC paper)
+        self.assertAlmostEqual(t["entry"], px, delta=px * 0.0005)            # one sweep of the 5 levels, <= 0.05%
+        self.assertEqual(t["exec"]["entry_children"], 1)
         # parallel trades: AUSDT is taken too (margin left after BUSDT)
         self.assertEqual([x["symbol"] for x in self.b.book("1H RSI SHORT")["more_trades"]], ["AUSDT"])
         risk = abs(t["stop"] - t["entry"])
         self.assertGreaterEqual(risk / t["entry"] * 100, 0.5 - 1e-9)
-        self.assertLessEqual(t["risk_usd"], 5.0 + 1e-9)
-        self.assertGreater(t["risk_usd"], 4.5)
+        self.assertLessEqual(risk / t["entry"], 0.03)
+        self.assertAlmostEqual(t["contracts"] * t["cv"], 2.5)                  # the 0.05% impact limit binds
+        self.assertEqual(t["extra"]["size_binding"], "price impact")
+        self.assertAlmostEqual(t["margin"], 2.5 * t["entry"] / 20)
+        self.assertAlmostEqual(t["hard_stop"], R.round_tick(t["entry"] * 1.03, t["tick"], "up"))
+        self.assertGreater(t["liq_price"], t["stop"])
+        usd, pct = R.loss_if_stopped("short", 2.5, t["entry"], t["stop"], 0.05, t["equity"])
+        self.assertAlmostEqual(t["loss_if_stopped_pct"], round(pct, 2))
         e = self.ev("ENTRY")[-1]
         self.assertEqual(e["book"], "1H RSI SHORT")
         self.assertIn("RSI gap", e["setup"])
         self.assertIn("SHORT ENTERED [1H RSI SHORT]", self.sent[-1])
         self.assertIn("Target: none - stop to entry at 1R, then trailing in whole R from 3R", self.sent[-1])
+        self.assertIn("Loss if stopped: $", self.sent[-1])
+        self.assertIn("Liquidation: ", self.sent[-1])
         # exit: BE at 1R, trail from 3R (2R locked), then the trail is hit
         e0, r0 = t["entry"], risk
         steps = [e0 - 1.05 * r0, e0 - 3.2 * r0, e0 - 4.1 * r0, e0 - 2.9 * r0]
@@ -563,8 +604,8 @@ class Execution(Runner):
             return px, list(csv.DictReader(fh))[-1]
 
     def test_too_little_liquidity(self):
-        px, row = self.go(lambda px: [(px, 0.01)] * 5)          # 20% of 0.05 coins is under the $5 min notional
-        self.assertEqual((row["taken"], row["reason"], row["liq_capped"]), ("no", "too little liquidity", "yes"))
+        px, row = self.go(lambda px: [(px, 0.008)] * 5)         # 0.04 coins within 0.05%: under the $5 min notional
+        self.assertEqual((row["taken"], row["reason"], float(row["impact_qty"])), ("no", "too little liquidity", 0.04))
         self.assertIsNone(self.b.book("1H RSI SHORT")["open_trade"])
 
     def test_liquidity_cap_and_partial_fill(self):
@@ -574,9 +615,9 @@ class Execution(Runner):
         self.assertAlmostEqual(t["contracts"] * t["cv"], 3.0)
         self.assertEqual(t["entry"], px)
         self.assertEqual((row["taken"], row["entry_ref"], float(row["qty_filled"]), row["liq_capped"]),
-                         ("yes", f"{px}", 3.0, "no"))
+                         ("yes", f"{px}", 3.0, "yes"))                    # impact limit 3.15, 3 fill within the cap
         self.assertGreater(float(row["qty_intended"]), 3.0)
-        self.assertGreater(int(row["entry_children"]), 1)
+        self.assertEqual(row["entry_children"], "1")                     # one sweep up to the cap
         self.assertEqual(float(row["entry_slip_pct"]), 0.0)
         self.assertLess(abs(t["entry"] - t["stop"]) * 3.0, 5.0 + 1e-9)              # risk on what filled
         self.assertIn("fill 3/", t["extra"]["detail"])
@@ -585,14 +626,27 @@ class Execution(Runner):
         with open(os.path.join(self.d, "trades.csv"), newline="") as fh:
             tr = list(csv.DictReader(fh))[-1]
         self.assertEqual((tr["entry_ref"], tr["qty_filled"], tr["exit_children"]), (f"{px}", "3.0", "1"))
-        self.assertTrue(tr["exit_estimated"].startswith("yes"))
+        self.assertTrue(tr["exit_slip_estimated"].startswith("yes"))
+        self.assertEqual((tr["exit_estimated"], tr["strategy"]), ("True", "1H RSI SHORT"))
         self.assertEqual(tr["exit_ref"], f"{px * 1.0001}")                              # a short exit buys the ask
 
-    def test_liquidity_cap_cuts_the_size(self):
-        px, row = self.go(lambda px: [(px, 6.0)] + [(round(px * 0.95, 4), 1.0)] * 4)   # 30% (26 Nov 2026) of 10 = 3
+    def test_impact_limit_cuts_the_size(self):
+        bids = lambda px: [(px, 6.0)] + [(round(px * 0.95, 4), 1.0)] * 4                 # noqa: E731
+        px, row = self.go(bids)
+        lim = R.impact_limit(bids(px), 0.01, 0.0005)        # 6 + 0.06 of the 5%-lower level (avg just inside 0.05%)
+        self.assertAlmostEqual(lim, 6.06)
         t = self.b.book("1H RSI SHORT")["open_trade"]
-        self.assertAlmostEqual(t["contracts"] * t["cv"], 3.0)
-        self.assertEqual((row["liq_capped"], row["liq_cap_qty"], float(row["qty_intended"])), ("yes", "3.0", 3.0))
+        self.assertAlmostEqual(t["contracts"] * t["cv"], 6.0)                          # 0.95 is beyond the IOC cap
+        self.assertEqual((row["liq_capped"], float(row["impact_qty"]), float(row["qty_intended"])), ("yes", 6.06, 6.06))
+        self.assertAlmostEqual(float(row["target_qty"]), math.floor(100 * 20 / px / 0.01) * 0.01)
+
+    def test_deep_book_uses_the_whole_free_margin(self):
+        px, row = self.go(lambda px: [(px, 1e9)] * 5)
+        t = self.b.book("1H RSI SHORT")["open_trade"]
+        self.assertEqual((t["extra"]["size_binding"], row["liq_capped"]), ("free margin", "no"))
+        self.assertAlmostEqual(t["margin"], 100.0, delta=px * 0.01 / 20 + 1e-9)
+        self.assertLess(self.b.free_margin("1H RSI SHORT"), 0.1)
+        self.assertGreater(float(row["loss_pct_if_stopped"]), 10)            # 20x the stop distance, no risk cap
 
 
 class LimitExits(Runner):
@@ -635,7 +689,7 @@ class LimitExits(Runner):
         self.assertAlmostEqual(pend["guard"], t["entry"] - 0.5 * r0)
         self.assertAlmostEqual(pend["lim_qty"], self.half)
         self.assertIn("-> limit exit", self.sent[-1])
-        self.assertEqual(self.ev("LIMIT_EXIT")[0]["filled"], self.half)
+        self.assertAlmostEqual(self.ev("LIMIT_EXIT")[0]["filled"], self.half)
         self.fd.books = {"AUSDT": ([(s, 1e9)], [(round(pend["floor"] + tk, 6), 1e9)])}
         self.b.manage_open_trades(T0 + 3715)                        # above the floor: waits
         self.assertIn("pending_exit", t)
@@ -681,7 +735,7 @@ class LimitExits(Runner):
 
 
 class ParallelTrades(Runner):
-    """26 Nov 2026: a 1H RSI book takes every signal while it has free margin (balance - margin of open trades)."""
+    """26 Nov 2026: up to MAX_OPEN_TRADES (3) per book while it has free margin, each sized from the margin left."""
     def sig_for(self, syms, end=T0 + 300):
         cands, sig = find_signal("short", 300, 45, end)
         self.arm("short", [(s, 80.0 - i) for i, s in enumerate(syms)])
@@ -694,27 +748,28 @@ class ParallelTrades(Runner):
         with open(os.path.join(self.d, "candidates.csv"), newline="") as fh:
             return list(csv.DictReader(fh))
 
-    def test_takes_trades_until_margin_runs_out(self):
+    def test_at_most_three_trades(self):
         end, px = self.sig_for(["AUSDT", "BUSDT", "CUSDT", "DUSDT"])
         bk = self.b.book("1H RSI SHORT")
         self.r.tick(end + 8)
         trades = self.b.book_trades("1H RSI SHORT")
-        self.assertGreaterEqual(len(trades), 2)
+        self.assertEqual(len(trades), 3)
         used = sum(t["margin"] for t in trades)
         self.assertLessEqual(used, bk["balance"] + 1e-9)                    # never more margin than the balance
-        for t in trades:                                                    # risk per trade: 5% of the balance
-            self.assertLessEqual(t["risk_usd"], 0.05 * bk["balance"] + 1e-9)
         rows = self.rows()
         taken = [r["symbol"] for r in rows if r["taken"] == "yes"]
         self.assertEqual(taken, [t["symbol"] for t in trades])
         skipped = [r for r in rows if r["taken"] == "no"]
-        self.assertTrue(all(r["reason"] == "no free margin" for r in skipped))
+        self.assertEqual([r["reason"] for r in skipped], ["max open trades"])
         self.assertEqual(len(taken) + len(skipped), 4)
         self.assertAlmostEqual(self.b.free_margin("1H RSI SHORT"), bk["balance"] - used)
         st = self.b.status_text()
         self.assertIn(f"{len(trades)} open, free margin", st)
         for t in trades:
             self.assertIn(t["symbol"], st)
+        line = next(x for x in st.splitlines() if trades[0]["symbol"] in x)
+        for part in ("size 2.5", f"margin ${trades[0]['margin']:.2f}", "stop ", "liq ", "% of book"):
+            self.assertIn(part, line)
 
     def test_last_trade_sized_to_the_free_margin(self):
         end, px = self.sig_for(["AUSDT"])
@@ -724,7 +779,7 @@ class ParallelTrades(Runner):
         t = self.b.book_trades("1H RSI SHORT")[-1]
         self.assertEqual(t["symbol"], "AUSDT")
         self.assertLessEqual(t["margin"], bk["balance"] * 0.1 + 1e-6)
-        self.assertLess(t["risk_usd"], 0.05 * bk["balance"])               # smaller than a full-risk trade
+        self.assertEqual(t["extra"]["size_binding"], "free margin")
 
     def test_same_coin_not_twice(self):
         end, px = self.sig_for(["AUSDT"])
@@ -738,7 +793,6 @@ class ParallelTrades(Runner):
     def test_close_middle_trade_and_restart(self):
         end, px = self.sig_for(["AUSDT", "BUSDT", "CUSDT"])
         bk = self.b.book("1H RSI SHORT")
-        self.r.c["risk_pct"] = 1                                             # 10% margin each: all three fit
         self.r.tick(end + 8)
         syms = [t["symbol"] for t in self.b.book_trades("1H RSI SHORT")]
         self.assertEqual(len(syms), 3)
@@ -754,3 +808,63 @@ class ParallelTrades(Runner):
         self.b.close_trade(first, {"reason": "STOP_LOSS", "price": first["stop"], "ts": end + 960, "estimated": True})
         self.assertEqual((bk["open_trade"]["symbol"], bk["more_trades"]), (syms[2], []))
         self.assertEqual([n for n, _ in self.b.open_trades()], ["1H RSI SHORT"])
+
+
+class SizingV2(Runner):
+    """26 Nov 2026: stop too wide, liquidation before the stop, hard stop, trades.csv / candidates.csv headers."""
+    go = Execution.go
+
+    def test_stop_too_wide_skipped(self):
+        self.r.c["max_stop"] = 0.001                                         # every stop is wider than 0.1%
+        px, row = self.go(lambda px: [(px, 1e9)] * 5)
+        self.assertEqual((row["taken"], row["reason"]), ("no", "stop too wide"))
+        self.assertIsNone(self.b.book("1H RSI SHORT")["open_trade"])
+        self.assertIn("% from the entry", self.ev("RSI1H_SKIP")[-1]["reason"])
+
+    def test_liquidation_before_stop_refused(self):
+        self.r.c["mmr"] = 0.045                                              # liq ~0.5% above a 20x short
+        px, row = self.go(lambda px: [(px, 1e9)] * 5)
+        self.assertEqual((row["taken"], row["reason"]), ("no", "liquidation before stop"))
+        self.assertTrue(row["liq_price"])
+
+    def test_hard_stop_label(self):
+        px, _ = self.go(lambda px: [(px, 1e9)] * 5)
+        t = self.b.book("1H RSI SHORT")["open_trade"]
+        t["stop_source"], t["stop"] = "hard", t["hard_stop"]
+        res = {"reason": "STOP_LOSS", "price": t["stop"], "ts": T0 + 900, "estimated": True}
+        with mock.patch.object(self.b, "check_exit_by_candles", lambda t, now: dict(res)):
+            self.b.manage_open_trades(T0 + 900)
+        self.assertEqual(self.ev("EXIT")[-1]["reason"], "HARD_STOP")
+
+    def test_trades_header_repaired(self):
+        path = os.path.join(self.d, "trades.csv")
+        head = R.Rsi1h.TRADE_HEAD
+        bad = [x for x in head if x != "exit_estimated"] + R.Rsi1h.TRADE_TAIL[:-2] + ["exit_estimated", "exit_type"]
+        row = ["x"] * 17 + ["True", "", "1H RSI SHORT", "99.5"]
+        with open(path, "w", newline="") as fh:
+            csv.writer(fh).writerows([bad, row])
+        self.r.ensure_trades_header()
+        with open(path, newline="") as fh:
+            r = list(csv.reader(fh))
+        self.assertEqual(r[0], head + R.Rsi1h.TRADE_TAIL)
+        self.assertEqual(r[1], row)                                          # rows untouched
+        with open(path, newline="") as fh:
+            d = list(csv.DictReader(fh))[0]
+        self.assertEqual((d["exit_estimated"], d["strategy"], d["book_balance_usd"]), ("True", "1H RSI SHORT", "99.5"))
+        self.r.ensure_trades_header()                                        # idempotent
+        with open(path, newline="") as fh:
+            self.assertEqual(next(csv.reader(fh)), head + R.Rsi1h.TRADE_TAIL)
+
+    def test_candidates_header_extended(self):
+        path = os.path.join(self.d, "candidates.csv")
+        old = R.CAND_COLS[:R.CAND_COLS.index("free_margin")]
+        with open(path, "w", newline="") as fh:
+            csv.writer(fh).writerows([old, ["1"] * len(old)])
+        self.r.ensure_cand_header()
+        with open(path, newline="") as fh:
+            r = list(csv.reader(fh))
+        self.assertEqual((r[0], r[1]), (R.CAND_COLS, ["1"] * len(old)))
+
+
+if __name__ == "__main__":
+    unittest.main()
