@@ -282,6 +282,15 @@ def make_cfg():
 # --------------------------------------------------------------------------
 # Pure helpers (unit-tested)
 # --------------------------------------------------------------------------
+def usd(ex):
+    """execution's *_money fields -> the trades.csv *_usd columns (rounded); returns ex."""
+    for k in ("exit_slip", "exit_trigger_slip"):
+        if k + "_money" in ex:
+            v = ex.pop(k + "_money")
+            ex[k + "_usd"] = round(v, 4) if v is not None else ""
+    return ex
+
+
 def fnum(x, d=0.0):
     try:
         return float(x)
@@ -2241,17 +2250,25 @@ class Bot:
             return "no fill within cap"
         pct, money = execution.slippage("BUY" if side == "LONG" else "SELL", ref, r["avg"], r["filled"])
         ex.update(entry_avg=r["avg"], entry_slip_pct=round(pct, 4), entry_slip_usd=round(money, 4))
+        spr, spr_pct = execution.spread(book)                  # best ask - best bid at entry (26 Nov 2026)
+        if spr is not None:
+            ex.update(entry_spread=spr, entry_spread_pct=round(spr_pct, 4))
         t["contracts"] = int(round(r["filled"] / step))
         t["entry"] = r["avg"]
         return ""
 
     def exit_exec(self, t, res):
-        """Exit execution numbers for trades.csv. Paper: the market exit's slippage estimated by walking the live
-        depth (the P&L still uses the stop / candle price); live: the fill vs the level that triggered it."""
+        """Exit execution numbers for trades.csv, both signed (26 Nov 2026): vs the stop / target that triggered the
+        exit (exit_trigger_*) and vs the best bid / ask (exit_ref / exit_slip_*). Paper: the market exit is estimated
+        by walking the live depth when the exit is detected (the P&L still uses the stop / candle price); live: the
+        fill vs the trigger."""
         if res.get("exec"):
             return res["exec"]                       # a limit exit: its simulated fills
         qty = t["contracts"] * t["cv"]
         sell = tside(t) == "long"
+        r = res.get("reason") or ""
+        trig = t.get("tp") if r == "TAKE_PROFIT" else t["stop"] if r.endswith("STOP") or r == "STOP_LOSS" else None
+        kind = "target" if r == "TAKE_PROFIT" else "stop"
         try:
             if self.cfg["dry_run"]:
                 bids, asks = self.data.orderbook(t["symbol"], 20)
@@ -2259,17 +2276,15 @@ class Bot:
                 if not levels:
                     return {}
                 got, avg = execution.walk_market(levels, qty)
-                pct, money = execution.slippage("SELL" if sell else "BUY", levels[0][0], avg, got)
-                return {"exit_ref": levels[0][0], "exit_avg": avg, "exit_slip_pct": round(pct, 4),
-                        "exit_slip_usd": round(money, 4), "exit_children": 1,
-                        "exit_estimated": "yes" if got >= qty - 1e-12 else f"yes (book holds {got:g} of {qty:g})",
-                        "exit_type": "market"}
-            ref = t.get("tp") if res["reason"] == "TAKE_PROFIT" else t["stop"]
-            if not ref:
+                ex = execution.exit_slips("LONG" if sell else "SHORT", avg, got, levels[0][0], trig, kind)
+                ex.update(exit_avg=avg, exit_children=1, exit_type="market",
+                          exit_estimated="yes" if got >= qty - 1e-12 else f"yes (book holds {got:g} of {qty:g})")
+                return usd(ex)
+            if not trig:
                 return {}
-            pct, money = execution.slippage("SELL" if sell else "BUY", ref, res["price"], qty)
-            return {"exit_ref": ref, "exit_avg": res["price"], "exit_slip_pct": round(pct, 4),
-                    "exit_slip_usd": round(money, 4), "exit_children": 1, "exit_estimated": "no", "exit_type": "market"}
+            ex = execution.exit_slips("LONG" if sell else "SHORT", res["price"], qty, None, trig, kind)
+            ex.update(exit_avg=res["price"], exit_children=1, exit_estimated="no", exit_type="market")
+            return usd(ex)
         except Exception as e:  # noqa: BLE001
             log.warning("exit slippage %s: %s", t["symbol"], e)
             return {}
@@ -2295,7 +2310,7 @@ class Bot:
         sign = 1 if side == "LONG" else -1
         guard = t["entry"] + sign * c["exit_guard_r"] * risk0(t)
         pend = execution.start_exit(side, qty, t["tick"], t["stop"], c["exit_slip_cap_pct"], guard, res["reason"],
-                                    "trail")
+                                    "trail", touch=levels[0][0], trigger=t["stop"])
         pend.update(unit=t["cv"], trigger_ts=res["ts"])
         t["pending_exit"] = pend
         self.save_state()
@@ -2347,8 +2362,7 @@ class Bot:
 
     def finish_limit_exit(self, t, now=None):
         pend = t.pop("pending_exit")
-        ex = execution.exit_summary(pend)
-        ex["exit_slip_usd"] = round(ex.pop("exit_slip_money") or 0.0, 4)
+        ex = usd(execution.exit_summary(pend))
         self.close_trade(t, {"reason": pend["reason"], "price": ex["exit_avg"], "ts": int(now or time.time()),
                              "estimated": True, "exec": ex})
 
@@ -2777,7 +2791,9 @@ class Bot:
                            + [ee.get(k, "") for k in ("entry_ref", "entry_avg", "entry_slip_pct", "entry_slip_usd",
                                                       "entry_children", "qty_intended", "qty_filled", "liq_capped")]
                            + [xx.get(k, "") for k in ("exit_ref", "exit_avg", "exit_slip_pct", "exit_slip_usd",
-                                                      "exit_children", "exit_estimated", "exit_type")])
+                                                      "exit_children", "exit_estimated", "exit_type", "exit_trigger",
+                                                      "exit_trigger_slip_pct", "exit_trigger_slip_usd")]
+                           + [ee.get(k, "") for k in ("entry_spread", "entry_spread_pct")])
                           if self.rsi1h else []))
         d = book["day"].get(dk, {})
         m = book["month"].get(mk, {})

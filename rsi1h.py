@@ -361,7 +361,11 @@ class Rsi1h:
                   # lost that column at rsi_4h (25 Nov 2026 14:41 IST) and every older row read one column off
                   "exit_slip_estimated",
                   # 26 Nov 2026: market / limit / limit+market (limit: TRAIL_STOP whose market exit would slip > 0.1%)
-                  "exit_type"]
+                  "exit_type",
+                  # 26 Nov 2026: exit_ref / exit_slip_* = vs the best bid (long) / ask (short) at the exit;
+                  # exit_trigger_* = vs the stop / target that triggered it; signed, positive = worse; paper market
+                  # exits: estimated on the live book, the P&L still uses the stop. entry_spread = ask - bid at entry
+                  "exit_trigger", "exit_trigger_slip_pct", "exit_trigger_slip_usd", "entry_spread", "entry_spread_pct"]
 
     def ensure_trades_header(self):
         """trades.csv ends with ...,session,shadow_exit_pnl,setup. Only the header line is touched (older rows simply
