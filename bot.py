@@ -3022,7 +3022,12 @@ class Bot:
             sys.exit("No live products found. Check DELTA_ENV / BINANCE_ENV and network access.")
         self.switch_exchange()
         eq = self.equity_usd()
-        if eq <= 0:
+        if eq <= 0 and c["dry_run"] and self.state.get("books"):
+            # paper with books (26 Nov 2026): each book trades its own balance; the old account figure
+            # (START_CAPITAL_INR + all paper P&L, retired books included) can go below 0 without meaning anything
+            log.warning("paper account figure is $%.2f (START_CAPITAL_INR + all paper P&L); the books trade their own "
+                        "balances, starting anyway", eq)
+        elif eq <= 0:
             sys.exit("Could not determine account equity (zero balance?). Set TRADING_CAPITAL_USD in .env or fund the account.")
         if self.rsi1h:
             self.rsi1h.ensure_books()                    # $100 each, before init_books (which would fund from POC)
