@@ -629,6 +629,14 @@ class Execution(Runner):
         self.assertTrue(tr["exit_slip_estimated"].startswith("yes"))
         self.assertEqual((tr["exit_estimated"], tr["strategy"]), ("True", "1H RSI SHORT"))
         self.assertEqual(tr["exit_ref"], f"{px * 1.0001}")                              # a short exit buys the ask
+        # 26 Nov 2026: also vs the stop (signed) and the entry spread
+        walk = px * 1.0001                                                              # the ask holds it all
+        self.assertAlmostEqual(float(tr["exit_trigger"]), t["stop"])
+        self.assertAlmostEqual(float(tr["exit_trigger_slip_pct"]), round((walk - t["stop"]) / t["stop"] * 100, 4))
+        self.assertLess(float(tr["exit_trigger_slip_pct"]), 0)                         # ask under the stop: better
+        self.assertAlmostEqual(float(tr["entry_spread"]), px * 1.0001 - px)
+        msg = next(m for m in self.sent if m.startswith("TRADE CLOSED"))
+        self.assertIn("% vs stop ", msg)
 
     def test_impact_limit_cuts_the_size(self):
         bids = lambda px: [(px, 6.0)] + [(round(px * 0.95, 4), 1.0)] * 4                 # noqa: E731
