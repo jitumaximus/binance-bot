@@ -2198,11 +2198,14 @@ class Bot:
         self.event("ABORTED", symbol=t["symbol"], reason=reason)
         self.tg.send(f"TRADE ABORTED {t['symbol']}: {reason}. Position was closed at market.")
 
-    def capped_entry(self, t, min_notional, book=None):
+    def capped_entry(self, t, min_notional, book=None, impact_qty=None, impact_capped=False, sweep=None):
         """Liquidity cap + capped IOC entry (execution.py) for trade t (side, symbol, product_id, contracts, cv = qty
         step, tick). Paper: simulated on the live /fapi/v1/depth; live: BinanceLiveVenue. Returns "" when something
         filled (t updated: contracts = filled, entry = average fill, exec = the numbers), else the short skip reason
-        ("no order book", "too little liquidity", "no fill within cap"); t["exec"] holds what is known."""
+        ("no order book", "too little liquidity", "no fill within cap"); t["exec"] holds what is known.
+        impact_qty (1H RSI books, 26 Nov 2026): the size was already limited to the 0.05% price-impact limit, which
+        replaces the liq_cap_pct-of-top-5 cap; liq_cap_qty / liq_capped then report that limit. sweep: the first IOC
+        child takes the whole size at this price (the last level inside the impact limit), capped as usual."""
         c, step = self.cfg, t["cv"]
         side = "LONG" if tside(t) == "long" else "SHORT"
         ex = t["exec"] = {}
@@ -2217,16 +2220,22 @@ class Bot:
             return "no order book"
         ref = levels[0][0]
         qty = round(t["contracts"] * step, 10)
-        capped, max_q, depth5 = execution.liquidity_cap(qty, step, levels, c["liq_cap_pct"])
-        ex.update(depth5_qty=round(depth5, 10), liq_cap_qty=max_q, liq_capped="yes" if capped < qty - 1e-12 else "no",
-                  qty_risk=qty, entry_ref=ref)
+        if impact_qty is None:
+            capped, max_q, depth5 = execution.liquidity_cap(qty, step, levels, c["liq_cap_pct"])
+            ex.update(depth5_qty=round(depth5, 10), liq_cap_qty=max_q,
+                      liq_capped="yes" if capped < qty - 1e-12 else "no", qty_risk=qty, entry_ref=ref)
+        else:
+            capped = min(qty, impact_qty)
+            ex.update(depth5_qty=round(sum(q for _, q in levels[:5]), 10), liq_cap_qty=impact_qty,
+                      liq_capped="yes" if impact_capped or capped < qty - 1e-12 else "no", qty_risk=qty, entry_ref=ref)
         if capped < step - 1e-12 or capped * ref < min_notional - 1e-9:
             return "too little liquidity"
         min_units = math.ceil(min_notional / ref / step - 1e-9) * step
         venue = (execution.PaperVenue(lambda: self.data.orderbook(t["symbol"], 20)) if c["dry_run"]
                  else BinanceLiveVenue(self.api, self.data, t))
         r = execution.run_entry(venue, side, capped, step, t["tick"], c["entry_slip_cap_pct"], book,
-                                min_units=min_units, sleep=time.sleep, max_children=c["entry_max_children"])
+                                min_units=min_units, sleep=time.sleep, max_children=c["entry_max_children"],
+                                sweep=sweep)
         ex.update(entry_cap=r["cap"], entry_children=r["children"], qty_intended=capped, qty_filled=r["filled"])
         if r["filled"] < step - 1e-12 or not r["avg"]:
             return "no fill within cap"
@@ -2371,7 +2380,12 @@ class Bot:
                 f"Target: none - stop to entry at {t['be_r']:g}R, then trailing in whole R from {t['trail_start_r']:g}R\n"
                 f"Size: {t['contracts'] * t['cv']:g} (~${t['notional']:.0f} notional), {t['leverage']:g}x isolated, "
                 f"margin ${t['margin']:.2f}\n"
-                f"Risk: ${t['risk_usd']:.2f} ({t['risk_usd'] / eq * 100:.2f}% of {bk}'s ${eq:.2f})\n"
+                f"Sizing: target {x.get('target_qty', 0):g} (free margin ${x.get('free_margin', 0):.2f} x {t['leverage']:g}), "
+                f"0.05% impact limit {x.get('impact_qty', 0):g} -> {x.get('size_binding', '')} binds\n"
+                f"Hard stop: {fmt(t['hard_stop'])}{' (active)' if t.get('stop_source') == 'hard' else ''} | "
+                f"Liquidation: {fmt(t['liq_price'])}\n"
+                f"Loss if stopped: ${t['loss_if_stopped_usd']:.2f} = {t['loss_if_stopped_pct']:.1f}% of {bk}'s ${eq:.2f} "
+                f"(incl. fees)\n"
                 f"{bk}: {len(self.book_trades(bk))} trade(s) open, free margin ${self.free_margin(bk):.2f}\n"
                 f"1H RSI {t['rsi']} | {x['detail']}\nNo real order placed (paper mode).")
             return
@@ -2659,13 +2673,17 @@ class Bot:
                 log.exception("managing %s failed", t.get("symbol"))
 
     def manage_rsi1h_paper(self, t, now):
-        """1H RSI paper trades: as manage_open_trade's paper path, plus limit exits for big TRAIL_STOP exits."""
+        """1H RSI paper trades: as manage_open_trade's paper path, plus limit exits for big TRAIL_STOP exits.
+        The hard stop (3% against the entry) is simulated: the active stop is always the closer of the two, so it is
+        hit as the stop; the exit is labelled HARD_STOP when the hard stop was the active one."""
         if t.get("pending_exit"):
             self.step_limit_exit(t, now)
             return
         res = self.check_exit_by_candles(t, now)
         self.save_state()
         if res:
+            if res["reason"] == "STOP_LOSS" and t.get("stop_source") == "hard":
+                res["reason"] = "HARD_STOP"
             if res["reason"] == "TRAIL_STOP" and self.start_limit_exit(t, res):
                 return
             self.close_trade(t, res)
@@ -2796,10 +2814,7 @@ class Bot:
             lines.append(f"\n{n}{tag}: ${b['balance']:.2f} "
                          f"(start ${b['start']:.2f}) | today {d.get('trades', 0)} trades, ${d.get('pnl', 0):+.2f}"
                          + (f" | {len(trades)} open, free margin ${self.free_margin(n):.2f}" if len(trades) > 1 else ""))
-            lines += [f"  {tside(t).upper()} {t['symbol']} x{t['contracts']} entry {fmt_price(t['entry'], t['tick'])} "
-                      f"SL {fmt_price(t['stop'], t['tick'])}{' (at entry)' if t.get('be_moved') else ''} "
-                      f"TP {fmt_price(t['tp'], t['tick']) if t.get('tp') else 'none (trailing)'}" for t in trades] \
-                or ["  no position"]
+            lines += [self.trade_status_line(t, b["balance"]) for t in trades] or ["  no position"]
         lines.append("")
         lines.append(self.wallet_line().strip() or "")
         lines.append(f"Short setups armed: {len(st['armed'])}")
@@ -2829,6 +2844,26 @@ class Bot:
         if self.bj:
             lines += ["", self.bj.status_text()]
         return "\n".join(x for x in lines if x is not None)
+
+    def trade_status_line(self, t, balance):
+        f = lambda x: fmt_price(x, t["tick"])  # noqa: E731
+        if t.get("strategy") == "rsi1h":
+            loss = (self.rsi1h_loss_pct(t, balance))
+            return (f"  {tside(t).upper()} {t['symbol']} size {t['contracts'] * t['cv']:g} entry {f(t['entry'])} | "
+                    f"margin ${t.get('margin') or 0:.2f} | stop {f(t['stop'])}"
+                    f"{' (at entry)' if t.get('be_moved') and not t.get('trail_r') else ''}"
+                    f"{' (trail ' + str(t['trail_r'] - 1) + 'R)' if t.get('trail_r') else ''} | "
+                    f"liq {f(t['liq_price']) if t.get('liq_price') else '-'} | loss if stopped {loss:+.1f}% of book")
+        return (f"  {tside(t).upper()} {t['symbol']} x{t['contracts']} entry {f(t['entry'])} "
+                f"SL {f(t['stop'])}{' (at entry)' if t.get('be_moved') else ''} "
+                f"TP {f(t['tp']) if t.get('tp') else 'none (trailing)'}")
+
+    def rsi1h_loss_pct(self, t, balance):
+        """Loss if the current stop fills, incl. fees, as % of the book (negative = the stop locks in a profit)."""
+        qty = t["contracts"] * t["cv"]
+        move = (t["stop"] - t["entry"]) if tside(t) == "short" else (t["entry"] - t["stop"])
+        usd = qty * move + self.cfg["fee_pct_per_side"] / 100.0 * qty * (t["entry"] + t["stop"])
+        return usd / balance * 100 if balance > 0 else 0.0
 
     def report(self, day=None):
         """Per-strategy results: one New York day, or since the account was split."""
@@ -2976,6 +3011,7 @@ class Bot:
         if self.rsi1h:
             self.rsi1h.ensure_books()                    # $100 each, before init_books (which would fund from POC)
             self.rsi1h.ensure_trades_header()
+            self.rsi1h.ensure_cand_header()
         self.init_books()
         self.state["paused_books"] = self.paused_books()        # read by mintoro-api (dashboard shows "paused")
         self.save_state()

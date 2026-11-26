@@ -51,7 +51,14 @@ Ported from the Fyers 2H RSI strategy (`fyers_bot/strategy.py` `_div_trigger`), 
 
 POC RETURN is unchanged and still trades one position at a time (no new POC order while a POC trade is open).
 
-**Parallel 1H RSI trades (since 26 Nov 2026):** each 1H RSI book takes every signal (in rank order) while it has free margin: free margin = the book's balance minus the margin of its open trades. Each trade still risks `RSI1H_RISK_PCT` (5%) of the book's balance; its notional is capped at `RSI1H_LEVERAGE` (20x) x the free margin, so the last trade that fits may be smaller; under the min notional = skipped "no free margin". A coin is never held twice (in any book). In state.json the oldest trade stays in `open_trade` and the others are in `more_trades`; when the oldest closes, the next one moves up. Total risk = 5% x the number of open trades.
+**1H RSI sizing v2 (since 26 Nov 2026, replaces 5% risk sizing, the 30%-of-top-5 cap and "trades until margin runs out" for these two books):**
+- Size = min(the book's free margin x `RSI1H_LEVERAGE` (20x isolated), the price-impact limit). Price-impact limit = the largest size whose average fill, walking our side of the live book (50 levels), stays within `MAX_IMPACT_PCT` (0.0005 = 0.05%) of the best price. The first IOC child sweeps that whole size at the last level inside the limit (never beyond the 0.1% entry cap); later children step on as before.
+- No max-loss cap: the loss if the stop fills (incl. fees) is logged as % of the book (Telegram, events.jsonl, candidates.csv `loss_pct_if_stopped`, /status, website).
+- Up to `MAX_OPEN_TRADES` (3) open trades per book, each sized from the free margin left at that moment; a coin is never held twice. State: oldest in `open_trade`, the rest in `more_trades`.
+- Signals whose stop is more than `MAX_STOP_PCT` (0.03) from the entry are skipped ("stop too wide").
+- Hard stop `HARD_STOP_PCT` (0.03) against the entry; the active stop is the closer of it and the candle stop (exit reason HARD_STOP when the hard stop was active). Paper only: the books refuse live mode, so no exchange STOP_MARKET is placed yet.
+- Liquidation price (isolated: entry x (1 - 1/lev) / (1 - mmr) long, x (1 + 1/lev) / (1 + mmr) short, `RSI1H_MMR` 0.01) must be beyond the stop plus the 0.1% entry cap, else "liquidation before stop". Binance's real per-coin rate needs a signed call; coins whose max leverage is 20x use 2.5%, which puts liquidation ~2.5% away.
+- trades.csv: the header lost `exit_estimated` (after rsi_4h) on 25 Nov 2026 14:41 IST because the execution tail used the same name, so every row read one column off. The tail column is now `exit_slip_estimated` and the bot restores the header at start (rows untouched).
 
 ## BOOK JUMP (retired 23 Nov 2026; `BJ_ENABLED=1` to run it again)
 

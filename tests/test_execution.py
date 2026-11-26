@@ -35,6 +35,18 @@ class Entry(unittest.TestCase):
         self.assertEqual((r["filled"], r["children"]), (250, 3))
         self.assertAlmostEqual(r["avg"], (100 * 100 + 100.05 * 100 + 100.1 * 50) / 250)
 
+    def test_sweep_takes_the_whole_size_in_one_child(self):
+        # levels 100 ticks apart: stepping a tick per child would never reach them; one sweep IOC at 100.02 does
+        b = book(asks=[(100.0, 2), (100.01, 2), (100.02, 2), (100.5, 99)])
+        r = X.run_entry(Fixed(b), "LONG", 6, 1, 0.0001, 0.001, b, sweep=100.02)
+        self.assertEqual((r["filled"], r["children"]), (6, 1))
+        self.assertAlmostEqual(r["avg"], 100.01)
+        r = X.run_entry(Fixed(b), "LONG", 6, 1, 0.0001, 0.001, b, sweep=100.5)   # never beyond the 100.10 cap
+        self.assertEqual((r["filled"], r["cap"]), (6, 100.1))
+        b = book(bids=[(100.0, 2), (99.99, 2)])
+        r = X.run_entry(Fixed(b), "SHORT", 4, 1, 0.0001, 0.001, b, sweep=99.99)
+        self.assertEqual((r["filled"], r["children"]), (4, 1))
+
     def test_partial_then_retry_then_keep_what_filled(self):
         b = book(asks=[(100.0, 100), (100.2, 1000)])           # the next level is beyond the 100.10 cap
         v = Fixed(b)

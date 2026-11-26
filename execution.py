@@ -119,10 +119,12 @@ class PaperVenue:
 
 
 def run_entry(venue, side, qty, unit, tick, cap_pct, first_book, min_units=None, sleep=None, max_children=20,
-              retries=1, cap=None):
+              retries=1, cap=None, sweep=None):
     """Capped IOC entry for qty (a multiple of unit). venue: book() -> (bids, asks); ioc(side, price, qty, book) ->
     (filled, avg). first_book = the book at signal time (gives the reference). sleep(seconds) between children
     (the bot keeps monitoring in it). cap: a fixed limit price instead of reference +/- cap_pct (exits).
+    sweep: the first child is ONE IOC for the whole qty at this limit price (never beyond the cap), e.g. the last
+    level inside a price-impact limit; later children step on from there as usual. None = start at the best price.
     Returns a dict with ref, cap, intended, filled, avg, children, attempts."""
     min_units = round(max(unit, min_units or unit), 10)
     lv0 = our_side(first_book, side)
@@ -145,6 +147,9 @@ def run_entry(venue, side, qty, unit, tick, cap_pct, first_book, min_units=None,
             continue
         out["attempts"] += 1
         price, n = levels[0][0], 0
+        first = sweep is not None and not attempt
+        if first:
+            price = cap if beyond(side, sweep, cap) else sweep
         while filled < qty - 1e-9 and n < max_children and not beyond(side, price, cap):
             if n:
                 if sleep:
@@ -155,6 +160,8 @@ def run_entry(venue, side, qty, unit, tick, cap_pct, first_book, min_units=None,
             best = levels[0][1] if levels else 0.0
             child = round(math.floor(min(rest, best) / unit + 1e-9) * unit, 10)
             child = max(child, min_units)
+            if first and not n:
+                child = round(math.floor(rest / unit + 1e-9) * unit, 10)
             if rest - child < min_units - 1e-9:      # a too-small last child merges into this one
                 child = round(rest, 10)
             if child > rest + 1e-9 or child < min_units - 1e-9:
