@@ -24,7 +24,8 @@ ENTRY     market at the start of the next candle (the check ~8 s after the close
           volume first (RSI1H_RANK_BY=volume, default since 25 Nov 2026; =rsi: most extreme 1H RSI first); if one is
           skipped, the next is tried. Up to MAX_OPEN_TRADES (3) open trades per book (26 Nov 2026), each sized from
           the free margin left at that moment; a coin is never held twice. 30-minute cooldown (RSI1H_COOLDOWN_MIN) on
-          a coin after a short on it closes.
+          a coin after a short on it closes; 60-minute cooldown (RSI1H_COOLDOWN_LONG_MIN, since 26 Nov 2026) after
+          a long on it closes.
 STOP      1 tick (STOP_BUFFER_TICKS) beyond the divergence candle's high (short) / low (long), at least
           RSI1H_MIN_STOP_PCT (0.5%) from entry (widened and logged if closer). Signals whose stop is more than
           MAX_STOP_PCT (3%) from the entry are skipped ("stop too wide"). Every trade also has a hard stop HARD_STOP_PCT
@@ -99,7 +100,8 @@ def load_cfg(env=None):
         "min_gap": int(f("RSI1H_MIN_GAP", 2)),
         "min_rsi_diff": f("RSI1H_MIN_RSI_DIFF", 3),
         "min_stop_pct": f("RSI1H_MIN_STOP_PCT", 0.5),
-        "cooldown_min": f("RSI1H_COOLDOWN_MIN", 30),
+        "cooldown_min": f("RSI1H_COOLDOWN_MIN", 30),              # after a short closes
+        "cooldown_long_min": f("RSI1H_COOLDOWN_LONG_MIN", 60),    # after a long closes (since 26 Nov 2026)
         "min_vol": f("RSI1H_MIN_VOL_USDT", 500_000),
         "slippage_pct": f("RSI1H_SLIPPAGE_PCT", 0),
         "be_r": f("RSI1H_BE_R", 1),
@@ -327,7 +329,7 @@ class Rsi1h:
         self.b, self.c = bot, cfg or load_cfg()
         self.st = bot.state.setdefault("rsi1h", {})
         for k, v in (("armed_short", {}), ("armed_long", {}), ("last_scan", 0), ("universe", 0), ("cooldown", {}),
-                     ("scan_ist", "")):
+                     ("cooldown_long", {}), ("scan_ist", "")):
             self.st.setdefault(k, v)
         self.prods = {}                  # symbol -> {"id", "symbol", "tick", "cv", "min_notional"}
         self.next_scan_try = 0.0
@@ -625,10 +627,11 @@ class Rsi1h:
         if held:
             return self.skip(sig, book, f"this coin is already held by {held[0]}",
                              "already held" if held[0] == book else "held by another book")
-        last = self.st["cooldown"].get(sym)
-        if side == "short" and last and now - last < c["cooldown_min"] * 60:
-            return self.skip(sig, book, f"cooldown: last {sym} short closed {(now - last) / 60:.0f} min ago "
-                                        f"(< {c['cooldown_min']:g} min)", "cooldown")
+        cd_key, cd_min = ("cooldown", c["cooldown_min"]) if side == "short" else ("cooldown_long", c["cooldown_long_min"])
+        last = self.st[cd_key].get(sym)
+        if last and now - last < cd_min * 60:
+            return self.skip(sig, book, f"cooldown: last {sym} {side} closed {(now - last) / 60:.0f} min ago "
+                                        f"(< {cd_min:g} min)", "cooldown")
         try:
             px = self.last_trade_price(sym)
         except Exception as ex:  # noqa: BLE001
@@ -735,10 +738,10 @@ class Rsi1h:
         return px * (1 + slip) if t["side"] == "short" else px * (1 - slip)
 
     def on_close(self, t, res):
-        if t["side"] == "short":
-            self.st["cooldown"][t["symbol"]] = int(res["ts"])
-            cut = res["ts"] - 86400
-            self.st["cooldown"] = {k: v for k, v in self.st["cooldown"].items() if v >= cut}
+        key = "cooldown" if t["side"] == "short" else "cooldown_long"
+        self.st[key][t["symbol"]] = int(res["ts"])
+        cut = res["ts"] - 86400
+        self.st[key] = {k: v for k, v in self.st[key].items() if v >= cut}
 
     # ---- reporting ----
     def status_lines(self):

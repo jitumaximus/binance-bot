@@ -43,7 +43,7 @@ Ported from the Fyers 2H RSI strategy (`fyers_bot/strategy.py` `_div_trigger`), 
 - **Stop**: 1 tick beyond the divergence candle's high / low, at least 0.5% (widened + `RSI1H_STOP_WIDENED`).
   **Exit**: no target; stop to entry at 1R, from 3R a whole-R trail 1R behind; checked on 1m candles like POC.
 - **Size**: 5% of the book at the stop, 20x isolated cap, step-rounded; skipped if Binance's min notional can't be
-  met within that. One open trade per book; several signals at one check: highest 24h quote volume first (`RSI1H_RANK_BY=volume`, default since 25 Nov 2026; `rsi` = most extreme 1H RSI first, the old order), the next one tried if one is skipped; 30-min cooldown on a coin after a short.
+  met within that. One open trade per book; several signals at one check: highest 24h quote volume first (`RSI1H_RANK_BY=volume`, default since 25 Nov 2026; `rsi` = most extreme 1H RSI first, the old order), the next one tried if one is skipped; 30-min cooldown on a coin after a short, 60-min (`RSI1H_COOLDOWN_LONG_MIN`, since 26 Nov 2026) after a long.
 - **Logs**: events `RSI1H_SCAN` (universe, armed counts, newly armed / dropped), `RSI1H_SIGNAL` (both RSI values and
   the gap), `RSI1H_SKIP` (reason), `RSI1H_STOP_WIDENED`, then the bot's `ENTRY` (with `setup`) / `EXIT`; trades.csv
   rows with strategy `1H RSI LONG` / `1H RSI SHORT` and the `setup` column. `/status` shows both books, the universe

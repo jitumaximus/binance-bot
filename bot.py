@@ -2746,7 +2746,7 @@ class Bot:
         exit_px = res["price"]
         if t.get("strategy") == "rsi1h" and self.rsi1h and not res.get("exec"):
             exit_px = self.rsi1h.exit_price(t, exit_px)            # RSI1H_SLIPPAGE_PCT against us (0 = none)
-            self.rsi1h.on_close(t, res)                             # 30-min cooldown after a short
+            self.rsi1h.on_close(t, res)                             # cooldown: 30 min after a short, 60 min after a long
         n, cv = t["contracts"], t["cv"]
         direction = 1 if tside(t) == "long" else -1
         gross = n * cv * (exit_px - t["entry"]) * direction

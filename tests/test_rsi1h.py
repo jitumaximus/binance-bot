@@ -418,6 +418,30 @@ class Runner(unittest.TestCase):
         self.assertLess(t["stop"], t["entry"])
         self.assertTrue(all(res in ("15m", "1m", "depth") for _, res in self.fd.calls))
 
+    def test_long_cooldown_60_min(self):
+        end = T0 + 900
+        cands, sig = find_signal("long", 900, 120, end)
+        self.arm("long", [("LUSDT", 22.0)])
+        self.fd.c15 = {"LUSDT": cands}
+        self.fd.px = {"LUSDT": round(sig["div_open"] * 1.001, 4)}
+        self.r.on_close({"side": "long", "symbol": "LUSDT"}, {"ts": end - 59 * 60})   # a long closed 59 min ago
+        self.assertNotIn("LUSDT", self.r.st["cooldown"])                               # shorts' cooldown untouched
+        self.r.tick(end + 8)
+        self.assertIsNone(self.b.book("1H RSI LONG")["open_trade"])
+        self.assertIn("cooldown: last LUSDT long closed", self.ev("RSI1H_SKIP")[-1]["reason"])
+        self.assertIn("(< 60 min)", self.ev("RSI1H_SKIP")[-1]["reason"])
+
+    def test_long_after_cooldown_and_short_cooldown_does_not_block_long(self):
+        end = T0 + 900
+        cands, sig = find_signal("long", 900, 120, end)
+        self.arm("long", [("LUSDT", 22.0)])
+        self.fd.c15 = {"LUSDT": cands}
+        self.fd.px = {"LUSDT": round(sig["div_open"] * 1.001, 4)}
+        self.r.st["cooldown_long"]["LUSDT"] = end - 61 * 60            # long closed 61 min ago: allowed
+        self.r.st["cooldown"]["LUSDT"] = end - 60                       # a short closed 1 min ago: shorts only
+        self.r.tick(end + 8)
+        self.assertEqual(self.b.book("1H RSI LONG")["open_trade"]["symbol"], "LUSDT")
+
     def test_no_candle_fetch_without_free_margin(self):
         self.arm("short", [("AUSDT", 75.0)])
         bal = self.b.book("1H RSI SHORT")["balance"]
