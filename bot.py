@@ -1053,11 +1053,11 @@ def pct_text(p):
 
 
 def stop_text(m):
-    """'price 3.54% · +70% on margin locked' / 'price 1.20% · -24% on margin' (margin_pcts output)."""
+    """'price 3.54% · +70% locked' / 'price 1.20% · -24%' (margin_pcts output; the % is of the trade's margin)."""
     out = f"price {m['stop_price_pct']:.2f}%" if m.get("stop_price_pct") is not None else ""
     if m.get("stop_pct_margin") is not None:
         p = m["stop_pct_margin"]
-        out += f" · {pct_text(p)} on margin" + (" locked" if p > 0 else "")
+        out += f" · {pct_text(p)}" + (" locked" if p > 0 else "")
     return out
 
 
@@ -2828,7 +2828,7 @@ class Bot:
             f"Gross P/L: ${gross:+.2f} (Rs {self.inr(gross):+.0f})\n"
             f"Est. fees: ${fees:.2f}\n"
             f"Net P/L: ${net:+.2f} (Rs {self.inr(net):+.0f})  [{r_mult:+.2f}R]"
-            + (f" · {pct_text(pnl_pct_m)} on margin ${t['margin']:.2f}" if pnl_pct_m is not None else "")
+            + (f" · {pct_text(pnl_pct_m)}" if pnl_pct_m is not None else "")
             + (f" · price {(exit_px / t['entry'] - 1) * 100:+.2f}%" if t.get("strategy") == "rsi1h" else "") + "\n"
             f"Duration: {human_dur(res['ts'] - t['opened_ts'])}\n"
             + (f"{execution.exit_text(xx, fmt)}\n" if xx else "") +
@@ -2893,7 +2893,7 @@ class Bot:
                 px = None
             m = self.margin_pcts(t, px)
             pnl = "" if m.get("pnl") is None else (
-                f"P&L ${m['pnl']:+.2f}" + (f" ({pct_text(m['pnl_pct_margin'])} on margin · price "
+                f"P&L ${m['pnl']:+.2f}" + (f" ({pct_text(m['pnl_pct_margin'])} · price "
                                            f"{m['price_move_pct']:+.2f}%)" if m.get("pnl_pct_margin") is not None
                                            else f" (price {m['price_move_pct']:+.2f}%)") + " | ")
             return (f"  {tside(t).upper()} {t['symbol']} size {t['contracts'] * t['cv']:g} entry {f(t['entry'])} | "

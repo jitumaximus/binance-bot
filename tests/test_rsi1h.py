@@ -938,22 +938,24 @@ class MarginPercent(Runner):
         self.fd.px[t["symbol"]] = now
         line = self.b.trade_status_line(t, self.b.book("1H RSI SHORT")["balance"])
         pnl = t["contracts"] * t["cv"] * (t["entry"] - now)
-        self.assertIn(f"P&L ${pnl:+.2f} ({bot.pct_text(pnl / m * 100)} on margin · price "
+        self.assertIn(f"P&L ${pnl:+.2f} ({bot.pct_text(pnl / m * 100)} · price "
                       f"{(now / t['entry'] - 1) * 100:+.2f}%)", line)
         self.assertIn(f"stop {bot.fmt_price(t['stop'], t['tick'])} (price {abs(t['stop'] / t['entry'] - 1) * 100:.2f}% · ",
                       line)
-        self.assertIn("% on margin) |", line)
+        self.assertIn("%) |", line)
+        self.assertNotIn("on margin", line)
         self.assertIn("% of book", line)
         # stop in profit: "locked"
         t["stop"] = round(t["entry"] * 0.995, 4)
-        self.assertIn("on margin locked", self.b.trade_status_line(t, 100.0))
+        self.assertRegex(self.b.trade_status_line(t, 100.0), r"· \+[\d.]+% locked\)")
         self.b.close_trade(t, {"reason": "TRAIL_STOP", "price": t["stop"], "ts": T0 + 3600, "estimated": True})
         x = self.ev("EXIT")[-1]
         with open(os.path.join(self.d, "trades.csv"), newline="") as fh:
             tr = list(csv.DictReader(fh))[-1]
         self.assertAlmostEqual(float(tr["pnl_pct_margin"]), round(x["net_pnl_usd"] / m * 100, 2), places=1)
         msg = next(s for s in self.sent if s.startswith("TRADE CLOSED"))
-        self.assertIn(f"{bot.pct_text(x['net_pnl_usd'] / m * 100)} on margin ${m:.2f} · price ", msg)
+        self.assertIn(f"R] · {bot.pct_text(x['net_pnl_usd'] / m * 100)} · price ", msg)
+        self.assertNotIn("on margin", msg)
 
     def test_pct_text(self):
         import bot
