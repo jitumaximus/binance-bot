@@ -98,6 +98,8 @@ class Ema20:
         self.lock = threading.Lock()
         self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ema20")
         self.last_poll = 0.0
+        self.ready = False              # no price watch until the first candle check after a start has run: armed
+                                        # setups from state.json may have been traded / expired while the bot was off
         self.exit_bar, self.exit_done = 0, set()     # 5m bar whose EMA exit check is running / trades checked
 
     # ---- books ----
@@ -154,7 +156,8 @@ class Ema20:
                 res = None
             if res is not None:
                 self.on_close(now, bar_j, res)
-        if (self.st["armed"] and now - self.last_poll >= self.c["poll_sec"] and not self.b.state.get("paused")
+        if (self.ready and self.st["armed"] and now - self.last_poll >= self.c["poll_sec"]
+                and not self.b.state.get("paused")
                 and any(self.has_room(sd) for sd in {a["side"] for a in self.st["armed"].values()})):
             self.last_poll = now
             try:
@@ -266,6 +269,7 @@ class Ema20:
         cut = now - 86400
         self.st["used"] = {k: v for k, v in used.items() if v >= cut}
         self.st["last_bar"] = bar
+        self.ready = True
         self.b.save_state()
         log.info("EMA20 %s close: %d/%d symbols (%d errors, %.1fs) | alerts %d, armed %d new / %d now, cancelled %d",
                  hm(last_t), len(res), job["n"], job["errors"], job["took"], n_alert, n_armed, len(armed), n_cancel)

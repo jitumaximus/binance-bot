@@ -107,6 +107,8 @@ class Retrace4h:
         self.job = None
         self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="retrace4h")
         self.last_poll = 0.0
+        self.ready = False              # no price watch until the first candle check after a start has run: armed
+                                        # setups from state.json may have been traded / expired while the bot was off
         self.lock = threading.Lock()
 
     # ---- books ----
@@ -162,7 +164,8 @@ class Retrace4h:
             except Exception:  # noqa: BLE001
                 log.exception("4H RETRACE scan failed")
         self.expire(now)
-        if (self.st["armed"] and now - self.last_poll >= self.c["poll_sec"] and not self.b.state.get("paused")
+        if (self.ready and self.st["armed"] and now - self.last_poll >= self.c["poll_sec"]
+                and not self.b.state.get("paused")
                 and any(self.has_room(sd) for sd in {a["side"] for a in self.st["armed"].values()})):
             self.last_poll = now
             try:
@@ -245,6 +248,7 @@ class Retrace4h:
         cut = now - 3 * 86400
         self.st["used"] = {k: v for k, v in used.items() if v >= cut}
         self.st["last_bar"] = bar
+        self.ready = True
         self.b.save_state()
         log.info("4H RETRACE %s close: %d symbols (%d errors) | setups %d, armed %d new / %d now, cancelled %d",
                  hm(bar - P4H), job["n"], job["errors"], n_setup, n_armed, len(armed), n_cancel)

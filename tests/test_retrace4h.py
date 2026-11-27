@@ -154,6 +154,20 @@ class Live(unittest.TestCase):
         self.assertEqual(self.x.st["armed"], {})
         self.assertIn("before it was watched", self.ev("4H_CANCEL")[-1]["reason"])
 
+    def test_no_price_watch_before_the_first_scan(self):
+        self.x.st["armed"]["RTUSDT|long|1"] = {"symbol": self.SYM, "side": "long", "candle": 1, "mid": 101.5,
+                                               "expires": 10 ** 12, "next_try": 0, "vol24h": 1, "open": 100.0, "high": 103.1,
+                                               "low": 99.9, "close": 103.0, "body_x": 3.0, "body_share": 0.94}
+        self.fd.px[self.SYM] = 101.0
+        self.x.st["last_bar"] = BAR0 + 3 * P4               # no new 4h close: no scan, so not ready
+        self.x.tick(BAR0 + 3 * P4 + 20)
+        self.assertFalse(self.x.ready)
+        self.assertEqual(self.b.book_trades("4H RETRACE LONG"), [])    # stale armed setups are not traded
+        self.x.ready = True
+        self.b._all_px = None
+        self.x.tick(BAR0 + 3 * P4 + 30)
+        self.assertEqual(len(self.b.book_trades("4H RETRACE LONG")), 1)
+
     def test_no_setup_no_arm(self):
         self.scan(candles())
         self.assertEqual(self.x.st["armed"], {})
