@@ -228,8 +228,8 @@ class Retrace4h:
                                  candle=ist(s["candle"]), open=s["open"], high=s["high"], low=s["low"],
                                  close=s["close"], body_share=round(s["body_share"], 3),
                                  avg_body=round(s["avg_body"], 10), body_x=round(s["body_x"], 2), mid=s["mid"])
-                if key in armed or key in used:
-                    continue
+                if key in armed or key in used or not s["new"]:
+                    continue                    # only the 4h candle that just closed arms (no late pick-up after a restart)
                 if s["touched_at"] is not None:
                     used[key] = s["candle"]
                     self.b.event("4H_CANCEL", book=book_of(s["side"]), side=s["side"], symbol=sym,

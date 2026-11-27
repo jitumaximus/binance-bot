@@ -41,8 +41,10 @@ def write_atomic(path, text):
     os.replace(tmp, path)
 
 
-def reset(d, now=None, trade_header=None, cand_header=None):
-    """Archive and reset the files in folder d. Returns the archive folder."""
+def reset(d, now=None, trade_header=None, cand_header=None, again=False):
+    """Archive and reset the files in folder d. Returns the archive folder.
+    again: reset the six running books once more (no renaming; their trades.csv rows are removed - the retired books
+    keep theirs) and clear the armed EMA20 / 4H RETRACE setups."""
     now = now or datetime.now(IST)
     with open(os.path.join(d, "state.json")) as fh:
         state = json.load(fh)
@@ -58,7 +60,8 @@ def reset(d, now=None, trade_header=None, cand_header=None):
         if os.path.exists(p):
             shutil.copy2(p, os.path.join(arch, f))
     since = now.isoformat(timespec="seconds")
-    old = {RENAME.get(n, n): b for n, b in (state.get("books") or {}).items()}
+    ren = {} if again else RENAME
+    old = {ren.get(n, n): b for n, b in (state.get("books") or {}).items() if not (again and n in BOOKS)}
     for n, b in old.items():
         b.setdefault("since", state.get("books_since") if n == "POC RETURN" else None)
         b["retired_at"] = b.get("retired_at") or since
@@ -66,6 +69,10 @@ def reset(d, now=None, trade_header=None, cand_header=None):
                                       "trades": 0, "wins": 0, "since": since} for n in BOOKS})
     state.update(paper_pnl=0.0, day={}, month={}, books_since=since, books_start_total=START * len(BOOKS),
                  reset_at=since, reset_archive=os.path.relpath(arch, d), paused_books=[])
+    if again:
+        for k in ("ema20", "retrace4h"):
+            if isinstance(state.get(k), dict):
+                state[k].update(armed={}, used={})
     write_atomic(os.path.join(d, "state.json"), json.dumps(state, indent=1))
     write_atomic(os.path.join(d, "events.jsonl"), "")
     tp = os.path.join(d, "trades.csv")
@@ -74,9 +81,11 @@ def reset(d, now=None, trade_header=None, cand_header=None):
             rows = list(csv.reader(fh))
         if rows and "strategy" in rows[0]:
             k = rows[0].index("strategy")
+            if again:
+                rows = rows[:1] + [r for r in rows[1:] if not (len(r) > k and r[k] in BOOKS)]
             for r in rows[1:]:
-                if len(r) > k and r[k] in RENAME:
-                    r[k] = RENAME[r[k]]
+                if len(r) > k and r[k] in ren:
+                    r[k] = ren[r[k]]
             tmp = tp + ".tmp"
             with open(tmp, "w", newline="") as fh:
                 csv.writer(fh).writerows(rows)
@@ -93,6 +102,7 @@ def main():
     ap.add_argument("--dir", required=True)
     ap.add_argument("--yes", action="store_true")
     ap.add_argument("--service", default="binance-bot")
+    ap.add_argument("--again", action="store_true", help="reset the six books again (no renaming, drop their trades)")
     a = ap.parse_args()
     d = os.path.abspath(os.path.expanduser(a.dir))
     sys.path.insert(0, d)
@@ -101,7 +111,8 @@ def main():
         raise SystemExit(f"{a.service} is running: stop it first")
     if not a.yes:
         raise SystemExit("add --yes")
-    arch = reset(d, trade_header=rsi1h.Rsi1h.TRADE_HEAD + rsi1h.Rsi1h.TRADE_TAIL, cand_header=rsi1h.CAND_COLS)
+    arch = reset(d, trade_header=rsi1h.Rsi1h.TRADE_HEAD + rsi1h.Rsi1h.TRADE_TAIL, cand_header=rsi1h.CAND_COLS,
+                 again=a.again)
     print(f"archived {', '.join(FILES)} -> {arch}; {len(BOOKS)} books at ${START:.0f}")
 
 

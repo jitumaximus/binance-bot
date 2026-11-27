@@ -236,7 +236,10 @@ class Ema20:
                     if s["alert_i"] == s["last_i"]:
                         n_alert += 1
                         alerts[side].append(sym)
-                    if s["status"] == "armed" and key not in armed and used.get(key) != s["alert_time"]:
+                    # only a setup that arms at THIS candle (its 2nd pullback candle just closed): after a restart,
+                    # older setups are never picked up late (28 Nov 2026)
+                    if (s["status"] == "armed" and s.get("armed_i") == s["last_i"] and key not in armed
+                            and used.get(key) != s["alert_time"]):
                         n_armed += 1
                         armed[key] = self.arm_record(sym, side, s)
                         a = armed[key]

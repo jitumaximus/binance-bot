@@ -147,12 +147,11 @@ class Live(unittest.TestCase):
         self.assertEqual(self.x.st["armed"], {})
         self.assertIn("expired", self.ev("4H_CANCEL")[-1]["reason"])
 
-    def test_touched_before_watching_is_cancelled(self):
+    def test_older_setups_are_not_armed_after_a_restart(self):
         c = candles(big=(100.0, 103.1, 99.9, 103.0))
-        c.append({"time": c[-1]["time"] + P4, "open": 103.0, "high": 103.2, "low": 101.4, "close": 102.5, "volume": 1})
-        self.scan(c)                                                       # restart one candle later: mid traded
+        c.append({"time": c[-1]["time"] + P4, "open": 103.0, "high": 103.2, "low": 102.6, "close": 102.9, "volume": 1})
+        self.scan(c)                                    # first scan one candle after the big one: never armed late
         self.assertEqual(self.x.st["armed"], {})
-        self.assertIn("before it was watched", self.ev("4H_CANCEL")[-1]["reason"])
 
     def test_no_price_watch_before_the_first_scan(self):
         self.x.st["armed"]["RTUSDT|long|1"] = {"symbol": self.SYM, "side": "long", "candle": 1, "mid": 101.5,

@@ -335,6 +335,11 @@ class Live(unittest.TestCase):
         self.assertEqual((t["symbol"], t["side"], t["book"]), ("SHUSDT", "short", "EMA20 SHORT"))
         self.assertGreater(t["margin"], 99)
 
+    def test_restart_does_not_pick_up_an_older_armed_setup(self):
+        c = add(long_setup(), (99.3, 99.6, 99.2, 99.4))               # armed one candle ago, bot was down
+        self.close(c)
+        self.assertEqual(self.e.st["armed"], {})
+
     def test_sides_config(self):
         self.e.c["sides"] = ("short",)
         self.close(long_setup())
