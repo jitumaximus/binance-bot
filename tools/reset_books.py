@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Reset the paper books (28 Nov 2026): archive trades.csv, events.jsonl, candidates.csv and state.json into
 data/archive/<IST date>/ (copies; nothing is deleted), then start every book in BOOKS at START with fresh stats.
+Retired books stay in state.json with their stats (the dashboard's retired section); an old book whose name a new
+book reuses is renamed (RENAME, e.g. "1H RSI LONG" -> "1H RSI LONG (v1)"), in state.json and in trades.csv's
+strategy column, so its history stays its own. events.jsonl and candidates.csv start empty.
 
   venv/bin/python tools/reset_books.py --dir ~/binance-bot --yes
 
 Refuses while the binance-bot service is running or while any book holds an open trade (it never closes trades).
 state.json keeps everything that is not a statistic (armed setups, universes, cooldowns, Telegram offset, ...);
-retired books (POC RETURN, BOOK JUMP, BJ ABSORB, EMA20 PULLBACK) leave the live state and live only in the archive.
 """
 import argparse
 import csv
@@ -22,6 +24,7 @@ IST = ZoneInfo("Asia/Kolkata")
 BOOKS = ("1H RSI LONG", "1H RSI SHORT", "EMA20 LONG", "EMA20 SHORT", "4H RETRACE LONG", "4H RETRACE SHORT")
 START = 100.0
 FILES = ("trades.csv", "events.jsonl", "candidates.csv", "state.json")
+RENAME = {"1H RSI LONG": "1H RSI LONG (v1)", "1H RSI SHORT": "1H RSI SHORT (v1)"}
 
 
 def open_trades(state):
@@ -55,14 +58,31 @@ def reset(d, now=None, trade_header=None, cand_header=None):
         if os.path.exists(p):
             shutil.copy2(p, os.path.join(arch, f))
     since = now.isoformat(timespec="seconds")
-    state["books"] = {n: {"start": START, "balance": START, "open_trade": None, "day": {}, "month": {},
-                          "trades": 0, "wins": 0, "since": since} for n in BOOKS}
+    old = {RENAME.get(n, n): b for n, b in (state.get("books") or {}).items()}
+    for n, b in old.items():
+        b.setdefault("since", state.get("books_since") if n == "POC RETURN" else None)
+        b["retired_at"] = b.get("retired_at") or since
+    state["books"] = dict(old, **{n: {"start": START, "balance": START, "open_trade": None, "day": {}, "month": {},
+                                      "trades": 0, "wins": 0, "since": since} for n in BOOKS})
     state.update(paper_pnl=0.0, day={}, month={}, books_since=since, books_start_total=START * len(BOOKS),
                  reset_at=since, reset_archive=os.path.relpath(arch, d), paused_books=[])
     write_atomic(os.path.join(d, "state.json"), json.dumps(state, indent=1))
     write_atomic(os.path.join(d, "events.jsonl"), "")
-    if trade_header:
-        write_atomic(os.path.join(d, "trades.csv"), ",".join(trade_header) + "\n")
+    tp = os.path.join(d, "trades.csv")
+    if os.path.exists(tp):                     # renamed books keep their rows under the new name
+        with open(tp, newline="") as fh:
+            rows = list(csv.reader(fh))
+        if rows and "strategy" in rows[0]:
+            k = rows[0].index("strategy")
+            for r in rows[1:]:
+                if len(r) > k and r[k] in RENAME:
+                    r[k] = RENAME[r[k]]
+            tmp = tp + ".tmp"
+            with open(tmp, "w", newline="") as fh:
+                csv.writer(fh).writerows(rows)
+            os.replace(tmp, tp)
+    elif trade_header:
+        write_atomic(tp, ",".join(trade_header) + "\n")
     if cand_header:
         write_atomic(os.path.join(d, "candidates.csv"), ",".join(cand_header) + "\n")
     return arch
