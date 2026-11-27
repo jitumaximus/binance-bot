@@ -21,9 +21,10 @@ ENTRY     price beyond the trigger -> capped IOC limit entry through the bot's e
           closed candle (between two price checks, or while the bot was down) cancels the setup: no late entry.
 STOP      (28 Nov 2026) the pullback level: the red pullback candle's low (the lower low if both are red); short: the
           green pullback candle's high (the higher high). It works on 5m CLOSES: a 5m candle closing beyond it exits
-          at market right after that close (PB_CLOSE); wicks through it don't count. The 3% hard stop always applies
-          on the price (the trade's price stop until breakeven).
-R         1R = entry - the closer of the pullback level and the 3% hard stop, at least EMA20_MIN_R_PCT (0.2%) of the
+          at market right after that close (PB_CLOSE); wicks through it don't count. The hard stop always applies
+          on the price (the trade's price stop until breakeven): EMA20_HARD_STOP_PCT, 1.5% (3% until 27 Nov 2026 22:1x
+          IST; the 1H RSI books keep HARD_STOP_PCT 3%).
+R         1R = entry - the closer of the pullback level and the hard stop, at least EMA20_MIN_R_PCT (0.2%) of the
           entry. R sets breakeven and the trail.
 EXITS     (market) whichever comes first:
           - a 5m candle closes beyond the pullback level (PB_CLOSE), or back through the 20 EMA (EMA_EXIT; below for
@@ -67,7 +68,8 @@ def load_cfg(env=None):
              max_wait=int(f("EMA20_MAX_WAIT", 12)), min_r_pct=f("EMA20_MIN_R_PCT", 0.002),
              check_delay=f("EMA20_CHECK_DELAY_SEC", 8), poll_sec=f("EMA20_POLL_SEC", 3),
              fetch_workers=int(f("EMA20_FETCH_WORKERS", 4)), be_r=f("EMA20_BE_R", 1),
-             trail_start_r=f("EMA20_TRAIL_START_R", 3))
+             trail_start_r=f("EMA20_TRAIL_START_R", 3),
+             hard_stop=f("EMA20_HARD_STOP_PCT", 0.015))    # 28 Nov 2026: 1.5% for this book (1H RSI books keep 3%)
     return c
 
 
@@ -396,7 +398,8 @@ class Ema20:
              "leverage": lev, "margin": info["margin"], "hard_stop": hard, "liq_price": liq,
              "loss_if_stopped_usd": round(loss_usd, 4), "loss_if_stopped_pct": round(loss_pct, 2),
              "trail": True, "trail_r": 0, "stop_set": True, "touch_close": 0, "tc_low": entry, "tc_high": entry,
-             "be_r": c["be_r"], "trail_start_r": c["trail_start_r"], "r_ema": r}
+             "be_r": c["be_r"], "trail_start_r": c["trail_start_r"], "r_ema": r,
+             "pb_stop": pb}                 # the 5m-close stop level (display: /status, mintoro-api)
         sig["taken"] = True
         R.record_leftover(b.book(BOOK), x["liq_capped"], free, info["margin"], sym, now)
         b.finish_entry(t, info, now)

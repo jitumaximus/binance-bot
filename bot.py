@@ -2940,13 +2940,25 @@ class Bot:
                 px = self.last_price(t["symbol"])
             except Exception:  # noqa: BLE001
                 px = None
-            m = self.margin_pcts(t, px)
+            pb = t.get("pb_stop") or (t.get("extra") or {}).get("pb") if t.get("strategy") == "ema20" else None
+            if pb and not t.get("be_moved") and abs(t["entry"] - pb) < abs(t["entry"] - t["stop"]):
+                # EMA20: until breakeven the nearer stop is the 5m close beyond the pullback level; the hard stop is
+                # the price stop behind it
+                tp = dict(t, stop=pb)
+                m = self.margin_pcts(tp, px)
+                loss = self.rsi1h_loss_pct(tp, balance)
+                stop_part = (f"stop: 5m close {'below' if tside(t) == 'long' else 'above'} {f(pb)} ({stop_text(m)}), "
+                             f"hard stop {f(t['stop'])} ({abs(t['stop'] / t['entry'] - 1) * 100:.2f}%)")
+            else:
+                m = self.margin_pcts(t, px)
+                stop_part = None
             pnl = "" if m.get("pnl") is None else (
                 f"P&L ${m['pnl']:+.2f}" + (f" ({pct_text(m['pnl_pct_margin'])} · price "
                                            f"{m['price_move_pct']:+.2f}%)" if m.get("pnl_pct_margin") is not None
                                            else f" (price {m['price_move_pct']:+.2f}%)") + " | ")
             return (f"  {tside(t).upper()} {t['symbol']} size {t['contracts'] * t['cv']:g} entry {f(t['entry'])} | "
-                    f"margin ${t.get('margin') or 0:.2f} | {pnl}stop {f(t['stop'])} ({stop_text(m)})"
+                    f"margin ${t.get('margin') or 0:.2f} | {pnl}"
+                    + (stop_part if stop_part else f"stop {f(t['stop'])} ({stop_text(m)})") +
                     f"{' (at entry)' if t.get('be_moved') and not t.get('trail_r') else ''}"
                     f"{' (trail ' + str(t['trail_r'] - 1) + 'R)' if t.get('trail_r') else ''} | "
                     f"liq {f(t['liq_price']) if t.get('liq_price') else '-'} | if stopped "

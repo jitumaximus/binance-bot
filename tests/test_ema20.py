@@ -170,7 +170,12 @@ class Live(unittest.TestCase):
         self.assertAlmostEqual(t["risk0"], t["entry"] - 99.1)                # 1R to the pullback low (closer than 3%)
         self.assertEqual(t["extra"]["pb"], 99.1)
         self.assertAlmostEqual(t["stop"], t["hard_stop"])                    # initial stop = the 3% hard stop
-        self.assertAlmostEqual(t["hard_stop"], t["entry"] * 0.97, delta=0.011)
+        self.assertAlmostEqual(t["hard_stop"], t["entry"] * 0.985, delta=0.011)          # EMA20: 1.5% hard stop
+        self.assertEqual(self.r.c["hard_stop"], 0.03)                                     # 1H RSI books keep 3%
+        line = next(x for x in self.b.status_text().splitlines() if "LONG PBUSDT" in x)
+        self.assertIn("stop: 5m close below 99.1", line)
+        self.assertIn("hard stop ", line)
+        self.assertIn("(1.5", line.split("hard stop ")[1])
         self.assertGreater(t["margin"], 99)                                  # the whole $100 book
         self.assertNotIn(f"{self.SYM}|long", self.e.st["armed"])
         self.assertIn("ENTERED [EMA20 PULLBACK]", self.sent[-1])
