@@ -283,6 +283,7 @@ class Runner(unittest.TestCase):
         b.rsi1h.ensure_books()
         b.rsi1h.ensure_trades_header()
         self.b, self.r = b, b.rsi1h
+        self.r.c["min_trade_margin"] = 0     # most tests size small trades; LeftoverMargin turns the 25% rule on
 
     def ev(self, typ):
         return [kw for t, kw in self.events if t == typ]
@@ -803,15 +804,18 @@ class ParallelTrades(Runner):
         for part in ("size 2.5", f"margin ${trades[0]['margin']:.2f}", "stop ", "liq ", "% of book"):
             self.assertIn(part, line)
 
-    def test_last_trade_sized_to_the_free_margin(self):
+    def test_last_trade_sized_to_the_leftover(self):
         end, px = self.sig_for(["AUSDT"])
         bk = self.b.book("1H RSI SHORT")
         bk["open_trade"] = {"symbol": "XUSDT", "product_id": 99, "side": "short", "margin": bk["balance"] * 0.9}
+        bk["leftover"] = {"margin": bk["balance"] * 0.1, "after": "XUSDT", "ts": end}   # XUSDT was impact-capped
+        self.fd.depth_qty = 1e9
         self.r.tick(end + 8)
         t = self.b.book_trades("1H RSI SHORT")[-1]
         self.assertEqual(t["symbol"], "AUSDT")
         self.assertLessEqual(t["margin"], bk["balance"] * 0.1 + 1e-6)
         self.assertEqual(t["extra"]["size_binding"], "free margin")
+        self.assertNotIn("leftover", bk)                     # used up, and this entry was not impact-capped
 
     def test_same_coin_not_twice(self):
         end, px = self.sig_for(["AUSDT"])
@@ -840,6 +844,120 @@ class ParallelTrades(Runner):
         self.b.close_trade(first, {"reason": "STOP_LOSS", "price": first["stop"], "ts": end + 960, "estimated": True})
         self.assertEqual((bk["open_trade"]["symbol"], bk["more_trades"]), (syms[2], []))
         self.assertEqual([n for n, _ in self.b.open_trades()], ["1H RSI SHORT"])
+
+
+class LeftoverMargin(Runner):
+    """27 Nov 2026: while trades are open, a new trade only for the leftover of an impact-capped entry; any trade
+    with margin < MIN_TRADE_MARGIN_PCT (25%) of the book is skipped ("too small")."""
+    sig_for = ParallelTrades.sig_for
+    rows = ParallelTrades.rows
+
+    def on(self):
+        self.r.c["min_trade_margin"] = 0.25
+
+    def test_freed_margin_does_not_start_a_small_trade(self):
+        # 27 Nov 11:40 IST: LINKUSDT opened with $4.93 because SAFEUSDT had just closed
+        self.on()
+        end, px = self.sig_for(["AUSDT"])
+        bk = self.b.book("1H RSI SHORT")
+        bk["open_trade"] = {"symbol": "XUSDT", "product_id": 99, "side": "short", "margin": bk["balance"] * 0.5}
+        self.fd.depth_qty = 1e9
+        self.r.tick(end + 8)
+        self.assertEqual(len(self.b.book_trades("1H RSI SHORT")), 1)
+        self.assertEqual(self.fd.calls, [])            # no room: not even a candle call (as with no free margin)
+        avail, why = self.r.avail_margin("1H RSI SHORT")
+        self.assertEqual((avail, why[1]), (0.0, "no leftover"))
+        self.assertIn("not cut by the price-impact limit", why[0])
+
+    def test_impact_capped_entries_chain_on_the_leftover(self):
+        self.on()
+        end, px = self.sig_for(["AUSDT", "BUSDT", "CUSDT", "DUSDT"])
+        self.fd.depth_qty = 1.2                       # 6 coins inside 0.05%: ~29% of a $100 book at 20x
+        bk = self.b.book("1H RSI SHORT")
+        self.r.tick(end + 8)
+        trades = self.b.book_trades("1H RSI SHORT")
+        self.assertEqual(len(trades), 3)
+        for t in trades:
+            self.assertEqual(t["extra"]["size_binding"], "price impact")
+            self.assertGreaterEqual(t["margin"], 0.25 * bk["balance"])
+        used = sum(t["margin"] for t in trades)
+        self.assertAlmostEqual(bk["leftover"]["margin"], bk["balance"] - used, places=3)
+        self.assertEqual(bk["leftover"]["after"], trades[-1]["symbol"])
+        self.assertEqual([r["reason"] for r in self.rows() if r["taken"] == "no"], ["max open trades"])
+        self.assertIn("leftover $", self.b.status_text())
+
+    def test_leftover_below_25_pct_is_too_small(self):
+        self.on()
+        end, px = self.sig_for(["AUSDT", "BUSDT"])
+        self.fd.depth_qty = 2.4                       # 12 coins: ~59% of the book, leftover ~41%...
+        bk = self.b.book("1H RSI SHORT")
+        self.r.c["max_impact"] = 0.0005
+        self.r.tick(end + 8)
+        n = len(self.b.book_trades("1H RSI SHORT"))
+        left = bk.get("leftover", {}).get("margin", 0)
+        if n == 2:                                    # ...then the second trade (~59% again) caps at the leftover
+            self.assertEqual(self.b.book_trades("1H RSI SHORT")[1]["extra"]["size_binding"], "free margin")
+        else:
+            self.assertLess(left, 0.25 * bk["balance"])
+        # a leftover under 25% of the book never trades
+        bk["leftover"] = {"margin": 0.2 * bk["balance"], "after": "AUSDT", "ts": end}
+        self.assertEqual(self.r.avail_margin("1H RSI SHORT")[1][1], "too small")
+        self.assertFalse(self.r.has_room("1H RSI SHORT"))
+
+    def test_first_trade_cut_below_25_pct_is_skipped(self):
+        self.on()
+        end, px = self.sig_for(["AUSDT"])             # default depth: 2.5 coins = ~12% of the book
+        self.r.tick(end + 8)
+        self.assertEqual(self.b.book_trades("1H RSI SHORT"), [])
+        row = self.rows()[-1]
+        self.assertEqual((row["taken"], row["reason"]), ("no", "too small"))
+        self.assertIn("price impact binds", self.ev("RSI1H_SKIP")[-1]["reason"])
+
+    def test_empty_book_clears_an_old_leftover(self):
+        self.on()
+        end, px = self.sig_for(["AUSDT"])
+        bk = self.b.book("1H RSI SHORT")
+        bk["leftover"] = {"margin": 5.0, "after": "XUSDT", "ts": end - 600}
+        self.fd.depth_qty = 1e9
+        self.r.tick(end + 8)
+        t = self.b.book("1H RSI SHORT")["open_trade"]
+        self.assertAlmostEqual(t["margin"], bk["balance"], delta=1)          # the whole book, not the $5 leftover
+        self.assertNotIn("leftover", bk)
+
+
+class MarginPercent(Runner):
+    """27 Nov 2026: P&L and stop as % of the trade's margin in /status, the exit message and trades.csv."""
+    go = Execution.go
+
+    def test_status_exit_and_trades_csv(self):
+        import bot
+        px, _ = self.go(lambda px: [(px, 1e9)] * 5)
+        t = self.b.book("1H RSI SHORT")["open_trade"]
+        m = t["margin"]
+        now = round(t["entry"] * 0.99, 4)                                   # price -1%: short in profit
+        self.fd.px[t["symbol"]] = now
+        line = self.b.trade_status_line(t, self.b.book("1H RSI SHORT")["balance"])
+        pnl = t["contracts"] * t["cv"] * (t["entry"] - now)
+        self.assertIn(f"P&L ${pnl:+.2f} ({bot.pct_text(pnl / m * 100)} on margin · price "
+                      f"{(now / t['entry'] - 1) * 100:+.2f}%)", line)
+        self.assertIn(f"stop {bot.fmt_price(t['stop'], t['tick'])} (price {abs(t['stop'] / t['entry'] - 1) * 100:.2f}% · ",
+                      line)
+        self.assertIn("% on margin) |", line)
+        self.assertIn("% of book", line)
+        # stop in profit: "locked"
+        t["stop"] = round(t["entry"] * 0.995, 4)
+        self.assertIn("on margin locked", self.b.trade_status_line(t, 100.0))
+        self.b.close_trade(t, {"reason": "TRAIL_STOP", "price": t["stop"], "ts": T0 + 3600, "estimated": True})
+        x = self.ev("EXIT")[-1]
+        with open(os.path.join(self.d, "trades.csv"), newline="") as fh:
+            tr = list(csv.DictReader(fh))[-1]
+        self.assertAlmostEqual(float(tr["pnl_pct_margin"]), round(x["net_pnl_usd"] / m * 100, 2), places=1)
+        msg = next(s for s in self.sent if s.startswith("TRADE CLOSED"))
+        self.assertIn(f"{bot.pct_text(x['net_pnl_usd'] / m * 100)} on margin ${m:.2f} · price ", msg)
+
+    def test_pct_text(self):
+        import bot
+        self.assertEqual((bot.pct_text(80.3), bot.pct_text(-4.51), bot.pct_text(-12.4)), ("+80%", "-4.5%", "-12%"))
 
 
 class SizingV2(Runner):

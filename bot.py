@@ -1046,6 +1046,21 @@ class Telegram:
 # --------------------------------------------------------------------------
 # Bot
 # --------------------------------------------------------------------------
+
+def pct_text(p):
+    """Signed percent for the margin figures: whole numbers from 10%, one decimal below (+80%, -4.5%)."""
+    return f"{p:+.0f}%" if abs(p) >= 10 else f"{p:+.1f}%"
+
+
+def stop_text(m):
+    """'price 3.54% · +70% on margin locked' / 'price 1.20% · -24% on margin' (margin_pcts output)."""
+    out = f"price {m['stop_price_pct']:.2f}%" if m.get("stop_price_pct") is not None else ""
+    if m.get("stop_pct_margin") is not None:
+        p = m["stop_pct_margin"]
+        out += f" · {pct_text(p)} on margin" + (" locked" if p > 0 else "")
+    return out
+
+
 class Bot:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -2774,6 +2789,8 @@ class Bot:
                    est_fees_usd=round(fees, 4), net_pnl_usd=round(net, 4), r_multiple=round(r_mult, 2),
                    estimated=res["estimated"], **({"execution": xx} if xx else {}))
         ee = t.get("exec") or {}
+        pnl_pct_m = (net / t["margin"] * 100 if t.get("margin") and t.get("strategy") == "rsi1h"
+                     else None)                                       # 27 Nov 2026: 1H RSI net P&L / margin used
         new_file = not os.path.exists(self.trades_file)
         with open(self.trades_file, "a", newline="") as fh:
             w = csv.writer(fh)
@@ -2793,7 +2810,8 @@ class Bot:
                            + [xx.get(k, "") for k in ("exit_ref", "exit_avg", "exit_slip_pct", "exit_slip_usd",
                                                       "exit_children", "exit_estimated", "exit_type", "exit_trigger",
                                                       "exit_trigger_slip_pct", "exit_trigger_slip_usd")]
-                           + [ee.get(k, "") for k in ("entry_spread", "entry_spread_pct")])
+                           + [ee.get(k, "") for k in ("entry_spread", "entry_spread_pct")]
+                           + ["" if pnl_pct_m is None else round(pnl_pct_m, 2)])
                           if self.rsi1h else []))
         d = book["day"].get(dk, {})
         m = book["month"].get(mk, {})
@@ -2809,7 +2827,9 @@ class Bot:
             f"Stop {fmt(t['stop'])} | Target {fmt(t['tp']) if t.get('tp') else 'none (trailing)'}\n"
             f"Gross P/L: ${gross:+.2f} (Rs {self.inr(gross):+.0f})\n"
             f"Est. fees: ${fees:.2f}\n"
-            f"Net P/L: ${net:+.2f} (Rs {self.inr(net):+.0f})  [{r_mult:+.2f}R]\n"
+            f"Net P/L: ${net:+.2f} (Rs {self.inr(net):+.0f})  [{r_mult:+.2f}R]"
+            + (f" · {pct_text(pnl_pct_m)} on margin ${t['margin']:.2f}" if pnl_pct_m is not None else "")
+            + (f" · price {(exit_px / t['entry'] - 1) * 100:+.2f}%" if t.get("strategy") == "rsi1h" else "") + "\n"
             f"Duration: {human_dur(res['ts'] - t['opened_ts'])}\n"
             + (f"{execution.exit_text(xx, fmt)}\n" if xx else "") +
             f"{bal_line}"
@@ -2829,7 +2849,9 @@ class Bot:
             tag = (" (paused)" if n in self.paused_books() else "") if n in self.enabled_books() else " (off)"
             lines.append(f"\n{n}{tag}: ${b['balance']:.2f} "
                          f"(start ${b['start']:.2f}) | today {d.get('trades', 0)} trades, ${d.get('pnl', 0):+.2f}"
-                         + (f" | {len(trades)} open, free margin ${self.free_margin(n):.2f}" if len(trades) > 1 else ""))
+                         + (f" | {len(trades)} open, free margin ${self.free_margin(n):.2f}" if len(trades) > 1 else "")
+                         + (f" | leftover ${b['leftover']['margin']:.2f} (impact-capped {b['leftover']['after']})"
+                            if trades and b.get("leftover") else ""))
             lines += [self.trade_status_line(t, b["balance"]) for t in trades] or ["  no position"]
         lines.append("")
         lines.append(self.wallet_line().strip() or "")
@@ -2865,14 +2887,41 @@ class Bot:
         f = lambda x: fmt_price(x, t["tick"])  # noqa: E731
         if t.get("strategy") == "rsi1h":
             loss = (self.rsi1h_loss_pct(t, balance))
+            try:
+                px = self.last_price(t["symbol"])
+            except Exception:  # noqa: BLE001
+                px = None
+            m = self.margin_pcts(t, px)
+            pnl = "" if m.get("pnl") is None else (
+                f"P&L ${m['pnl']:+.2f}" + (f" ({pct_text(m['pnl_pct_margin'])} on margin · price "
+                                           f"{m['price_move_pct']:+.2f}%)" if m.get("pnl_pct_margin") is not None
+                                           else f" (price {m['price_move_pct']:+.2f}%)") + " | ")
             return (f"  {tside(t).upper()} {t['symbol']} size {t['contracts'] * t['cv']:g} entry {f(t['entry'])} | "
-                    f"margin ${t.get('margin') or 0:.2f} | stop {f(t['stop'])}"
+                    f"margin ${t.get('margin') or 0:.2f} | {pnl}stop {f(t['stop'])} ({stop_text(m)})"
                     f"{' (at entry)' if t.get('be_moved') and not t.get('trail_r') else ''}"
                     f"{' (trail ' + str(t['trail_r'] - 1) + 'R)' if t.get('trail_r') else ''} | "
-                    f"liq {f(t['liq_price']) if t.get('liq_price') else '-'} | loss if stopped {loss:+.1f}% of book")
+                    f"liq {f(t['liq_price']) if t.get('liq_price') else '-'} | if stopped "
+                    + (f"-{loss:.1f}% of book" if loss > 0 else f"+{-loss:.1f}% of book locked"))
         return (f"  {tside(t).upper()} {t['symbol']} x{t['contracts']} entry {f(t['entry'])} "
                 f"SL {f(t['stop'])}{' (at entry)' if t.get('be_moved') else ''} "
                 f"TP {f(t['tp']) if t.get('tp') else 'none (trailing)'}")
+
+    def margin_pcts(self, t, px=None):
+        """Percentages for the 1H RSI open-trade lines (27 Nov 2026): the stop's price distance from the entry and the
+        net P&L (fees incl.) if it fills, as % of the trade's margin; with a current price px also the P&L (no fees,
+        like the dashboard) as % of margin and the raw price move since the entry. Keys missing when unknown."""
+        qty, e, st, m = t["contracts"] * t["cv"], t["entry"], t["stop"], t.get("margin") or 0.0
+        d = 1 if tside(t) == "long" else -1
+        out = {"stop_price_pct": abs(st / e - 1) * 100 if e else None}
+        fees = self.cfg["fee_pct_per_side"] / 100.0 * qty * (e + st)
+        if m > 0:
+            out["stop_pct_margin"] = (qty * (st - e) * d - fees) / m * 100
+        if px and e:
+            out["pnl"] = qty * (px - e) * d
+            out["price_move_pct"] = (px / e - 1) * 100
+            if m > 0:
+                out["pnl_pct_margin"] = out["pnl"] / m * 100
+        return out
 
     def rsi1h_loss_pct(self, t, balance):
         """Loss if the current stop fills, incl. fees, as % of the book (negative = the stop locks in a profit)."""

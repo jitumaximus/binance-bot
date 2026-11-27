@@ -22,8 +22,12 @@ ENTRY     market at the start of the next candle (the check ~8 s after the close
           and logged. Paper fill = last trade price, RSI1H_SLIPPAGE_PCT against us (0 = like the POC paper fills),
           taker fee FEE_PCT_PER_SIDE on both sides (in bot.close_trade). Several coins at once: highest 24h quote
           volume first (RSI1H_RANK_BY=volume, default since 25 Nov 2026; =rsi: most extreme 1H RSI first); if one is
-          skipped, the next is tried. Up to MAX_OPEN_TRADES (3) open trades per book (26 Nov 2026), each sized from
-          the free margin left at that moment; a coin is never held twice. 30-minute cooldown (RSI1H_COOLDOWN_MIN) on
+          skipped, the next is tried. Up to MAX_OPEN_TRADES (3) open trades per book (26 Nov 2026). The first trade
+          of an empty book is sized from its whole free margin; while trades are open, a new one is allowed ONLY for
+          the leftover of the previous entry when that entry was cut down by the price-impact limit (liq_capped =
+          yes), and only for that remainder (27 Nov 2026): margin freed by a trade closing never starts a new small
+          trade while others are open. Any trade whose margin would be below MIN_TRADE_MARGIN_PCT (25%) of the
+          book's balance is skipped ("too small"). A coin is never held twice. 30-minute cooldown (RSI1H_COOLDOWN_MIN) on
           a coin after a short on it closes; 60-minute cooldown (RSI1H_COOLDOWN_LONG_MIN, since 26 Nov 2026) after
           a long on it closes.
 STOP      1 tick (STOP_BUFFER_TICKS) beyond the divergence candle's high (short) / low (long), at least
@@ -87,6 +91,7 @@ def load_cfg(env=None):
         # sizing v2 (26 Nov 2026); fractions, not percent
         "max_impact": f("MAX_IMPACT_PCT", 0.0005),       # average fill within 0.05% of the best price
         "max_open": int(f("MAX_OPEN_TRADES", 3)),         # open trades per book
+        "min_trade_margin": f("MIN_TRADE_MARGIN_PCT", 0.25),  # 27 Nov 2026: skip trades with margin < 25% of the book
         "max_stop": f("MAX_STOP_PCT", 0.03),              # skip signals whose stop is further than 3%
         "hard_stop": f("HARD_STOP_PCT", 0.03),            # protective stop 3% against the entry
         "mmr": f("RSI1H_MMR", 0.01),                      # maintenance margin rate for the liquidation price
@@ -367,7 +372,9 @@ class Rsi1h:
                   # 26 Nov 2026: exit_ref / exit_slip_* = vs the best bid (long) / ask (short) at the exit;
                   # exit_trigger_* = vs the stop / target that triggered it; signed, positive = worse; paper market
                   # exits: estimated on the live book, the P&L still uses the stop. entry_spread = ask - bid at entry
-                  "exit_trigger", "exit_trigger_slip_pct", "exit_trigger_slip_usd", "entry_spread", "entry_spread_pct"]
+                  "exit_trigger", "exit_trigger_slip_pct", "exit_trigger_slip_usd", "entry_spread", "entry_spread_pct",
+                  # 27 Nov 2026: net P&L as % of the margin the trade used (1H RSI)
+                  "pnl_pct_margin"]
 
     def ensure_trades_header(self):
         """trades.csv ends with ...,session,shadow_exit_pnl,setup. Only the header line is touched (older rows simply
@@ -420,7 +427,8 @@ class Rsi1h:
                 f"<{c['oversold']:g} long, divergence on 5m ({c['short_window']:g} min) / 15m ({c['long_window']:g} min), "
                 f"RSI gap >= {c['min_rsi_diff']:g} | stop beyond the divergence candle, min {c['min_stop_pct']:g}% | "
                 f"BE {c['be_r']:g}R, trail from {c['trail_start_r']:g}R, no target | size: free margin x {c['leverage']:g}x "
-                f"isolated, capped at {c['max_impact'] * 100:g}% price impact, up to {c['max_open']} trades per book | "
+                f"isolated, capped at {c['max_impact'] * 100:g}% price impact, up to {c['max_open']} trades per book (extra trades "
+                f"only for the leftover of an impact-capped entry), margin >= {c['min_trade_margin'] * 100:g}% of the book | "
                 f"stop <= {c['max_stop'] * 100:g}% (else skipped), hard stop {c['hard_stop'] * 100:g}% | universe: USDT perps with 24h vol >= ${c['min_vol'] / 1e3:,.0f}k, hourly | "
                 f"several signals: {'highest 24h volume' if c['rank_by'] == 'volume' else 'most extreme 1H RSI'} first")
 
@@ -459,8 +467,32 @@ class Rsi1h:
                     self.evaluate(now, bnd, side, pend)
 
     def has_room(self, book):
-        """A book may open another trade while it has fewer than MAX_OPEN_TRADES open and free margin left."""
-        return len(self.b.book_trades(book)) < self.c["max_open"] and self.b.free_margin(book) > 1e-6
+        """A book may open another trade while it has fewer than MAX_OPEN_TRADES open and enough margin for one."""
+        return len(self.b.book_trades(book)) < self.c["max_open"] and self.avail_margin(book)[1] is None
+
+    def avail_margin(self, book):
+        """(margin a new trade may use, None) or (0, (reason, short reason)).
+        Empty book: its whole free margin. Trades open: only the leftover of the previous entry if that entry was cut
+        down by the price-impact limit (book["leftover"]), never more than the free margin. Below MIN_TRADE_MARGIN_PCT
+        of the balance: too small."""
+        b = self.b
+        bk = b.book(book)
+        free, n = b.free_margin(book), len(b.book_trades(book))
+        if n == 0:
+            bk.pop("leftover", None)                     # an empty book starts from its whole balance
+            avail = free
+        else:
+            lo = bk.get("leftover") or {}
+            if not lo.get("margin"):
+                return 0.0, (f"{book} has {n} trade(s) open and the previous entry was not cut by the price-impact "
+                             f"limit: no leftover to trade (free margin ${free:.2f} stays unused)", "no leftover")
+            avail = min(free, lo["margin"])
+        need = self.c["min_trade_margin"] * bk["balance"]
+        if avail < need or avail <= 1e-6:
+            return 0.0, (f"too small: ${avail:.2f} margin available < {self.c['min_trade_margin'] * 100:g}% of the "
+                         f"book's balance ${bk['balance']:.2f} (${need:.2f})" + (f", {n} trade(s) open" if n else ""),
+                         "too small")
+        return avail, None
 
     # ---- hourly universe + arming ----
     def universe(self):
@@ -618,9 +650,9 @@ class Rsi1h:
         if len(b.book_trades(book)) >= c["max_open"]:
             return self.skip(sig, book, f"{book} already has {len(b.book_trades(book))} trades open "
                                         f"(MAX_OPEN_TRADES {c['max_open']})", "max open trades")
-        if not self.has_room(book):
-            return self.skip(sig, book, f"{book} has no free margin left (balance ${b.book(book)['balance']:.2f}, "
-                                        f"{len(b.book_trades(book))} trade(s) open)", "no free margin")
+        avail, why = self.avail_margin(book)
+        if why:
+            return self.skip(sig, book, why[0], why[1])
         if p is None:
             return self.skip(sig, book, "not in the universe any more", "not in universe")
         held = [n for n, t in b.open_trades() if t["product_id"] == p["id"]]
@@ -671,12 +703,17 @@ class Rsi1h:
             return self.skip(sig, book, f"liquidation {liq:g} ({liq_pct * 100:.2f}%) is not beyond the stop {stop:g} "
                                         f"({abs(entry - stop) / entry * 100:.2f}%) at {lev:g}x", "liquidation before stop")
         equity = b.book(book)["balance"]
-        free = b.free_margin(book)
+        free = avail                                   # whole free margin (empty book) or the impact leftover
         impact = impact_limit(lv, p["cv"], c["max_impact"])
         n, info = size_for(free, lev, entry, p["cv"], p["min_notional"], impact)
         cand.update(free_margin=round(free, 4), target_qty=info.get("target_qty"), impact_qty=info.get("impact_qty"))
         if n < 1:
             return self.skip(sig, book, f"size: {info.get('skip')}", info.get("short", "size (min notional)"))
+        need = c["min_trade_margin"] * equity
+        if info["margin"] < need:
+            return self.skip(sig, book, f"too small: margin ${info['margin']:.2f} ({info['binding']} binds) < "
+                                        f"{c['min_trade_margin'] * 100:g}% of the book's balance ${equity:.2f} "
+                                        f"(${need:.2f})", "too small")
         cand["size"] = n * p["cv"]
         tx = {"side": side, "symbol": sym, "product_id": p["id"], "contracts": n, "cv": p["cv"], "tick": tick}
         why = b.capped_entry(tx, p["min_notional"], ob, impact_qty=impact,
@@ -730,6 +767,12 @@ class Rsi1h:
              "trail": True, "trail_r": 0, "stop_set": True, "touch_close": 0, "tc_low": entry, "tc_high": entry,
              "be_r": c["be_r"], "trail_start_r": c["trail_start_r"]}
         sig["taken"] = True
+        bk = b.book(book)
+        left = free - info["margin"]
+        if x["liq_capped"] == "yes" and left > 1e-6:     # only an impact-capped entry leaves a leftover to trade
+            bk["leftover"] = {"margin": round(left, 4), "after": sym, "ts": int(now)}
+        else:
+            bk.pop("leftover", None)
         b.finish_entry(t, info, now)
 
     # ---- hooks called from bot.close_trade ----

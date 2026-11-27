@@ -36,7 +36,8 @@ ADDED = {"Bot.paused_books", "Bot.poc_pause_step",          # POC_ENABLED=0 paus
          "Bot.finish_limit_exit",                           # 1H RSI limit exits (26 Nov 2026)
          "Bot.book_trades", "Bot.free_margin", "Bot.add_trade", "Bot.drop_trade",   # parallel 1H RSI trades
          "Bot.trade_status_line", "Bot.rsi1h_loss_pct",     # /status per trade (26 Nov 2026, sizing v2)
-         "usd"}                                             # exit slippage vs stop + vs book (26 Nov 2026)
+         "usd",                                             # exit slippage vs stop + vs book (26 Nov 2026)
+         "Bot.margin_pcts", "pct_text", "stop_text"}        # 1H RSI % on margin in /status (27 Nov 2026)
 POC_FUNCS = ("Bot.tick_poc", "Bot.poc_pending_step", "Bot.poc_filled", "Bot.poc_place_limit", "Bot.poc_cancel",
              "Bot.poc_take_at_poc", "Bot.build_pocs", "Bot.poc_tier1", "Bot.manage_poc_live", "Bot.touch_stop_price",
              "Bot.set_touch_stop", "Bot.apply_trail", "Bot.apply_be", "Bot.entry_allowed",
