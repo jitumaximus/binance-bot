@@ -72,7 +72,9 @@ CAND_COLS = ["time", "bot", "book", "symbol", "side", "check", "taken", "reason"
              "depth5_qty", "liq_cap_qty", "liq_capped", "entry_ref", "entry_cap", "entry_avg", "entry_slip_pct",
              "entry_slip_money", "entry_children", "qty_intended", "qty_filled",
              # sizing v2 (26 Nov 2026, binance-bot): free margin x leverage vs the 0.05% price-impact limit (coins)
-             "free_margin", "target_qty", "impact_qty", "hard_stop", "liq_price", "loss_pct_if_stopped"]
+             "free_margin", "target_qty", "impact_qty", "hard_stop", "liq_price", "loss_pct_if_stopped",
+             # EMA20 PULLBACK (28 Nov 2026): EMA20 at arming, 1R as % of the entry (level = trigger, ref_time = alert)
+             "ema20", "r_pct"]
 
 
 def load_cfg(env=None):
@@ -329,6 +331,39 @@ def loss_if_stopped(side, qty, entry, stop, fee_pct, balance):
 # --------------------------------------------------------------------------
 # Runner (uses the bot's data client, books, entry/exit bookkeeping and Telegram)
 # --------------------------------------------------------------------------
+def avail_margin(b, book, min_pct):
+    """(margin a new trade may use, None) or (0, (reason, short reason)). Shared by the 1H RSI and EMA20 books.
+    Empty book: its whole free margin. Trades open: only the leftover of the previous entry if that entry was cut
+    down by the price-impact limit (book["leftover"]), never more than the free margin. Below MIN_TRADE_MARGIN_PCT
+    of the balance: too small."""
+    bk = b.book(book)
+    free, n = b.free_margin(book), len(b.book_trades(book))
+    if n == 0:
+        bk.pop("leftover", None)                     # an empty book starts from its whole balance
+        avail = free
+    else:
+        lo = bk.get("leftover") or {}
+        if not lo.get("margin"):
+            return 0.0, (f"{book} has {n} trade(s) open and the previous entry was not cut by the price-impact "
+                         f"limit: no leftover to trade (free margin ${free:.2f} stays unused)", "no leftover")
+        avail = min(free, lo["margin"])
+    need = min_pct * bk["balance"]
+    if avail < need or avail <= 1e-6:
+        return 0.0, (f"too small: ${avail:.2f} margin available < {min_pct * 100:g}% of the "
+                     f"book's balance ${bk['balance']:.2f} (${need:.2f})" + (f", {n} trade(s) open" if n else ""),
+                     "too small")
+    return avail, None
+
+
+def record_leftover(bk, liq_capped, free, margin, sym, now):
+    """After an entry: only an impact-capped entry leaves a leftover the book may trade while others are open."""
+    left = free - margin
+    if liq_capped == "yes" and left > 1e-6:
+        bk["leftover"] = {"margin": round(left, 4), "after": sym, "ts": int(now)}
+    else:
+        bk.pop("leftover", None)
+
+
 class Rsi1h:
     def __init__(self, bot, cfg=None):
         self.b, self.c = bot, cfg or load_cfg()
@@ -471,28 +506,7 @@ class Rsi1h:
         return len(self.b.book_trades(book)) < self.c["max_open"] and self.avail_margin(book)[1] is None
 
     def avail_margin(self, book):
-        """(margin a new trade may use, None) or (0, (reason, short reason)).
-        Empty book: its whole free margin. Trades open: only the leftover of the previous entry if that entry was cut
-        down by the price-impact limit (book["leftover"]), never more than the free margin. Below MIN_TRADE_MARGIN_PCT
-        of the balance: too small."""
-        b = self.b
-        bk = b.book(book)
-        free, n = b.free_margin(book), len(b.book_trades(book))
-        if n == 0:
-            bk.pop("leftover", None)                     # an empty book starts from its whole balance
-            avail = free
-        else:
-            lo = bk.get("leftover") or {}
-            if not lo.get("margin"):
-                return 0.0, (f"{book} has {n} trade(s) open and the previous entry was not cut by the price-impact "
-                             f"limit: no leftover to trade (free margin ${free:.2f} stays unused)", "no leftover")
-            avail = min(free, lo["margin"])
-        need = self.c["min_trade_margin"] * bk["balance"]
-        if avail < need or avail <= 1e-6:
-            return 0.0, (f"too small: ${avail:.2f} margin available < {self.c['min_trade_margin'] * 100:g}% of the "
-                         f"book's balance ${bk['balance']:.2f} (${need:.2f})" + (f", {n} trade(s) open" if n else ""),
-                         "too small")
-        return avail, None
+        return avail_margin(self.b, book, self.c["min_trade_margin"])
 
     # ---- hourly universe + arming ----
     def universe(self):
@@ -767,12 +781,7 @@ class Rsi1h:
              "trail": True, "trail_r": 0, "stop_set": True, "touch_close": 0, "tc_low": entry, "tc_high": entry,
              "be_r": c["be_r"], "trail_start_r": c["trail_start_r"]}
         sig["taken"] = True
-        bk = b.book(book)
-        left = free - info["margin"]
-        if x["liq_capped"] == "yes" and left > 1e-6:     # only an impact-capped entry leaves a leftover to trade
-            bk["leftover"] = {"margin": round(left, 4), "after": sym, "ts": int(now)}
-        else:
-            bk.pop("leftover", None)
+        record_leftover(b.book(book), x["liq_capped"], free, info["margin"], sym, now)
         b.finish_entry(t, info, now)
 
     # ---- hooks called from bot.close_trade ----

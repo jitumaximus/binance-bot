@@ -108,6 +108,7 @@ import requests
 
 import bookjump
 import execution
+import ema20
 import rsi1h
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -117,7 +118,7 @@ STOCK_TOKEN_RE = re.compile(r"bStocks? Token|xStock Token|ONDO Token|Gold Token|
 PERIOD = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "2h": 7200, "4h": 14400}
 ARM_TF = "2h"            # RSI arming timeframe (was 4h); candles close at even UTC hours
 ARM = ARM_TF.upper()
-BOOKS = (f"{ARM} RSI SHORT", f"{ARM} RSI LONG", "1H BREAKOUT", "1H BREAKDOWN", "POC RETURN") + rsi1h.BOOKS
+BOOKS = (f"{ARM} RSI SHORT", f"{ARM} RSI LONG", "1H BREAKOUT", "1H BREAKDOWN", "POC RETURN") + rsi1h.BOOKS + ema20.BOOKS
 RR = 5.0  # fixed reward-to-risk (1:5). Not configurable on purpose.
 log = logging.getLogger("bot")
 
@@ -224,6 +225,8 @@ def make_cfg():
         "enable_bookjump": b("BJ_ENABLED", "0"),
         # 1H RSI LONG / 1H RSI SHORT (rsi1h.py): paper mode on Binance only; settings RSI1H_* read by rsi1h.load_cfg
         "enable_rsi1h": b("RSI1H_ENABLED", "1"),
+        # EMA20 PULLBACK (ema20.py, 28 Nov 2026): paper mode on Binance only; settings EMA20_* read by ema20.load_cfg
+        "enable_ema20": b("EMA20_ENABLED", "1"),
         "poc_away_pct": f("POC_AWAY_PCT", 2.0),            # top coins (POC_MAJORS)
         "poc_away_other_pct": f("POC_AWAY_OTHER_PCT", 5.0),  # every other coin (stock/ETF tokens use 2%)
         "poc_majors": lst("POC_MAJORS") or [x + ("USDT" if exchange == "binance" else "USD") for x in
@@ -535,6 +538,8 @@ def book_for(side, strategy):
         return "POC RETURN"
     if strategy == "rsi1h":
         return f"1H RSI {side.upper()}"
+    if strategy == "ema20":
+        return ema20.BOOK
     if strategy == "breakdown":
         return "1H BREAKDOWN"
     return "1H BREAKOUT" if strategy == "breakout" else f"{ARM} RSI {side.upper()}"
@@ -1091,6 +1096,13 @@ class Bot:
                 cfg["enable_rsi1h"] = False
             else:
                 self.rsi1h = rsi1h.Rsi1h(self)
+        self.ema20, self.ema20_refused = None, ""   # EMA20 PULLBACK book (ema20.py)
+        if cfg.get("enable_ema20"):
+            self.ema20_refused = rsi1h.refuse_reason(cfg)
+            if self.ema20_refused:
+                cfg["enable_ema20"] = False
+            else:
+                self.ema20 = ema20.Ema20(self)
         self.migrate_trades_header()
 
     def migrate_trades_header(self):
@@ -1256,7 +1268,8 @@ class Bot:
     def enabled_books(self):
         c = self.cfg
         return [n for n, on in zip(BOOKS, (c["enable_short"], c["enable_long"], c["enable_breakout"], c["enable_breakdown"],
-                                         c["enable_poc"], c.get("enable_rsi1h"), c.get("enable_rsi1h"))) if on]
+                                         c["enable_poc"], c.get("enable_rsi1h"), c.get("enable_rsi1h"),
+                                         c.get("enable_ema20"))) if on]
 
     def paused_books(self):
         return ["POC RETURN"] if self.cfg["enable_poc"] and self.cfg["poc_paused"] else []
@@ -2397,8 +2410,25 @@ class Bot:
                    notional_usd=round(t["notional"], 2), rsi_4h=t["rsi"], stop_source=t.get("stop_source"),
                    leverage=t.get("leverage"), margin_usd=round(t.get("margin", 0.0), 2),
                    orderbook=t.get("ob"), **({"execution": t["exec"]} if t.get("exec") else {}),
-                   **({"setup": t["extra"].get("detail")} if t.get("strategy") == "rsi1h" else {}))
+                   **({"setup": t["extra"].get("detail")} if t.get("strategy") in ("rsi1h", "ema20") else {}))
         fmt = lambda x: fmt_price(x, t["tick"])  # noqa: E731
+        if t.get("strategy") == "ema20":
+            x = t["extra"]
+            self.tg.send(
+                f"{tside(t).upper()} ENTERED [{bk}] [{c['mode']}]\n{t['symbol']}\n"
+                f"Entry: {fmt(t['entry'])} (last price {x['last_price']:g}, trigger {x['trigger']:g})\n"
+                + (f"{execution.entry_text(t['exec'], fmt)}\n" if t.get("exec") else "") +
+                f"1R: {x['r']:.6g} ({x['r'] / t['entry'] * 100:.2f}%) | hard stop {fmt(t['hard_stop'])} "
+                f"({t['loss_if_stopped_pct']:.1f}% of {bk}'s ${eq:.2f}, fees incl.)\n"
+                f"Exit: a 5m close {'below' if tside(t) == 'long' else 'above'} the 20 EMA, stop to entry at "
+                f"{t['be_r']:g}R, trailing in whole R from {t['trail_start_r']:g}R, or the hard stop\n"
+                f"Size: {t['contracts'] * t['cv']:g} (~${t['notional']:.0f} notional), {t['leverage']:g}x isolated, "
+                f"margin ${t['margin']:.2f} | liquidation {fmt(t['liq_price'])}\n"
+                f"Sizing: target {x.get('target_qty', 0):g} (free margin ${x.get('free_margin', 0):.2f} x {t['leverage']:g}), "
+                f"0.05% impact limit {x.get('impact_qty', 0):g} -> {x.get('size_binding', '')} binds\n"
+                f"{bk}: {len(self.book_trades(bk))} trade(s) open, free margin ${self.free_margin(bk):.2f}\n"
+                f"{x['detail']}\nNo real order placed (paper mode).")
+            return
         if t.get("strategy") == "rsi1h":
             x = t["extra"]
             self.tg.send(
@@ -2697,6 +2727,9 @@ class Bot:
                 if t.get("strategy") == "rsi1h" and t["mode"] == "PAPER":
                     self.manage_rsi1h_paper(t, now)
                     continue
+                if t.get("strategy") == "ema20" and t["mode"] == "PAPER":
+                    self.manage_ema20_paper(t, now)
+                    continue
                 self.manage_open_trade(t, now)
             except Exception:  # noqa: BLE001
                 log.exception("managing %s failed", t.get("symbol"))
@@ -2715,6 +2748,16 @@ class Bot:
                 res["reason"] = "HARD_STOP"
             if res["reason"] == "TRAIL_STOP" and self.start_limit_exit(t, res):
                 return
+            self.close_trade(t, res)
+
+    def manage_ema20_paper(self, t, now):
+        """EMA20 PULLBACK paper trades: BE at 1R, trail from 3R and the 3% hard stop on 1-minute candles, exits at
+        market (no limit exits). The 5m close through the EMA is handled by ema20.py at each 5m close."""
+        res = self.check_exit_by_candles(t, now)
+        self.save_state()
+        if res:
+            if res["reason"] == "STOP_LOSS" and t.get("stop_source") == "hard":
+                res["reason"] = "HARD_STOP"
             self.close_trade(t, res)
 
     def manage_open_trade(self, t, now):
@@ -2789,7 +2832,7 @@ class Bot:
                    est_fees_usd=round(fees, 4), net_pnl_usd=round(net, 4), r_multiple=round(r_mult, 2),
                    estimated=res["estimated"], **({"execution": xx} if xx else {}))
         ee = t.get("exec") or {}
-        pnl_pct_m = (net / t["margin"] * 100 if t.get("margin") and t.get("strategy") == "rsi1h"
+        pnl_pct_m = (net / t["margin"] * 100 if t.get("margin") and t.get("strategy") in ("rsi1h", "ema20")
                      else None)                                       # 27 Nov 2026: 1H RSI net P&L / margin used
         new_file = not os.path.exists(self.trades_file)
         with open(self.trades_file, "a", newline="") as fh:
@@ -2804,7 +2847,7 @@ class Bot:
                         round(gross, 4), round(fees, 4), round(net, 4), round(self.inr(net), 2),
                         round(r_mult, 2), "" if t.get("rsi") is None else t.get("rsi"), res["estimated"],
                         (t.get("ob") or {}).get("ratio", ""), bk, round(book["balance"], 4)]
-                       + ((["", "", (t.get("extra") or {}).get("detail", "") if t.get("strategy") == "rsi1h" else ""]
+                       + ((["", "", (t.get("extra") or {}).get("detail", "") if t.get("strategy") in ("rsi1h", "ema20") else ""]
                            + [ee.get(k, "") for k in ("entry_ref", "entry_avg", "entry_slip_pct", "entry_slip_usd",
                                                       "entry_children", "qty_intended", "qty_filled", "liq_capped")]
                            + [xx.get(k, "") for k in ("exit_ref", "exit_avg", "exit_slip_pct", "exit_slip_usd",
@@ -2829,7 +2872,9 @@ class Bot:
             f"Est. fees: ${fees:.2f}\n"
             f"Net P/L: ${net:+.2f} (Rs {self.inr(net):+.0f})  [{r_mult:+.2f}R]"
             + (f" · {pct_text(pnl_pct_m)}" if pnl_pct_m is not None else "")
-            + (f" · price {(exit_px / t['entry'] - 1) * 100:+.2f}%" if t.get("strategy") == "rsi1h" else "") + "\n"
+            + (f" · price {(exit_px / t['entry'] - 1) * 100:+.2f}%" if t.get("strategy") in ("rsi1h", "ema20") else "")
+            + (f"\nExit: {t['extra']['ema_exit']}" if res["reason"] == "EMA_EXIT" and (t.get("extra") or {}).get("ema_exit") else "")
+            + "\n"
             f"Duration: {human_dur(res['ts'] - t['opened_ts'])}\n"
             + (f"{execution.exit_text(xx, fmt)}\n" if xx else "") +
             f"{bal_line}"
@@ -2879,13 +2924,15 @@ class Bot:
         lines += [f"  {s} range high {v['range_high']} ({v['band_pct']}%)" for s, v in top]
         if self.rsi1h:
             lines += [""] + self.rsi1h.status_lines()
+        if self.ema20:
+            lines += [""] + self.ema20.status_lines()
         if self.bj:
             lines += ["", self.bj.status_text()]
         return "\n".join(x for x in lines if x is not None)
 
     def trade_status_line(self, t, balance):
         f = lambda x: fmt_price(x, t["tick"])  # noqa: E731
-        if t.get("strategy") == "rsi1h":
+        if t.get("strategy") in ("rsi1h", "ema20"):
             loss = (self.rsi1h_loss_pct(t, balance))
             try:
                 px = self.last_price(t["symbol"])
@@ -3082,6 +3129,10 @@ class Bot:
             self.rsi1h.ensure_books()                    # $100 each, before init_books (which would fund from POC)
             self.rsi1h.ensure_trades_header()
             self.rsi1h.ensure_cand_header()
+        if self.ema20:
+            self.ema20.ensure_books()                    # $100 of its own, never funded from another book
+            if not self.rsi1h:
+                rsi1h.Rsi1h.ensure_trades_header(self.ema20)
         self.init_books()
         self.state["paused_books"] = self.paused_books()        # read by mintoro-api (dashboard shows "paused")
         self.save_state()
@@ -3098,6 +3149,10 @@ class Bot:
             bj_line += self.rsi1h.startup_line()
         elif self.rsi1h_refused:
             bj_line += f"\n1H RSI books: NOT started - paper mode on Binance only ({self.rsi1h_refused})."
+        if self.ema20:
+            bj_line += self.ema20.startup_line()
+        elif self.ema20_refused:
+            bj_line += f"\nEMA20 PULLBACK: NOT started - paper mode on Binance only ({self.ema20_refused})."
         if os.environ.get("ENABLE_BOOKJUMP", "").strip() == "1" and not c["enable_bookjump"]:
             log.info("ENABLE_BOOKJUMP=1 in .env is ignored: BOOK JUMP is retired (BJ_ENABLED=1 would start it)")
         log.info("Books running: %s%s", ", ".join(self.enabled_books()),
@@ -3148,6 +3203,11 @@ class Bot:
                 self.rsi1h.tick(now)
             except Exception:  # noqa: BLE001
                 log.exception("1H RSI tick failed")
+        if self.ema20:
+            try:
+                self.ema20.tick(now)
+            except Exception:  # noqa: BLE001
+                log.exception("EMA20 tick failed")
         if now - getattr(self, "_last_manage", 0) >= self.cfg["manage_interval"]:
             self._last_manage = now
             self.manage_open_trades(now)
