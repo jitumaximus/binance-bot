@@ -296,6 +296,17 @@ class Live(unittest.TestCase):
         self.e.poll(bar + 26)
         self.assertEqual(self.ev("EMA20_SKIP")[-1]["reason"][:9], "too small")
 
+    def test_after_a_fill_the_other_breaches_stay_armed(self):
+        c, bar = self.arm()
+        self.e.st["armed"]["QQUSDT|long"] = dict(self.e.arm_record("QQUSDT", "long", {
+            "trigger": 1.0, "low": 0.9, "pb": 0.95, "r": 0.05, "ema": 0.97, "alert_time": 5, "pull": [6, 7],
+            "armed_time": 7}), vol24h=1)
+        self.fd.px.update({self.SYM: 99.75, "QQUSDT": 1.1})
+        self.e.poll(bar + 23)
+        self.assertEqual(self.b.book("EMA20 PULLBACK")["open_trade"]["symbol"], self.SYM)   # higher volume first
+        self.assertIn("QQUSDT|long", self.e.st["armed"])                                  # not consumed
+        self.assertEqual(self.ev("EMA20_SKIP"), [])
+
     def test_sides_config(self):
         self.e.c["sides"] = ("short",)
         self.close(long_setup())

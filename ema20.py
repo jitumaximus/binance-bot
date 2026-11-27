@@ -282,6 +282,8 @@ class Ema20:
             return
         hits.sort(key=lambda h: -(h[0].get("vol24h") or 0))          # highest 24h volume first
         for rank, (a, p) in enumerate(hits, 1):
+            if rank > 1 and not self.has_room():
+                break                   # the book is full now: the rest stay armed (cancelled at the close if traded)
             key = f"{a['symbol']}|{a['side']}"
             self.st["armed"].pop(key, None)
             self.st["used"][key] = a["alert_time"]                       # a setup is used once
