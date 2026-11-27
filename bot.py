@@ -2418,9 +2418,11 @@ class Bot:
                 f"{tside(t).upper()} ENTERED [{bk}] [{c['mode']}]\n{t['symbol']}\n"
                 f"Entry: {fmt(t['entry'])} (last price {x['last_price']:g}, trigger {x['trigger']:g})\n"
                 + (f"{execution.entry_text(t['exec'], fmt)}\n" if t.get("exec") else "") +
-                f"1R: {x['r']:.6g} ({x['r'] / t['entry'] * 100:.2f}%) | hard stop {fmt(t['hard_stop'])} "
-                f"({t['loss_if_stopped_pct']:.1f}% of {bk}'s ${eq:.2f}, fees incl.)\n"
-                f"Exit: a 5m close {'below' if tside(t) == 'long' else 'above'} the 20 EMA, stop to entry at "
+                f"Stop: a 5m close {'below' if tside(t) == 'long' else 'above'} the pullback "
+                f"{'low' if tside(t) == 'long' else 'high'} {fmt(x['pb'])} or the hard stop {fmt(t['hard_stop'])} "
+                f"({t['loss_if_stopped_pct']:.1f}% of {bk}'s ${eq:.2f}, fees incl.) | 1R: {x['r']:.6g} "
+                f"({x['r'] / t['entry'] * 100:.2f}%)\n"
+                f"Exit also on a 5m close {'below' if tside(t) == 'long' else 'above'} the 20 EMA, stop to entry at "
                 f"{t['be_r']:g}R, trailing in whole R from {t['trail_start_r']:g}R, or the hard stop\n"
                 f"Size: {t['contracts'] * t['cv']:g} (~${t['notional']:.0f} notional), {t['leverage']:g}x isolated, "
                 f"margin ${t['margin']:.2f} | liquidation {fmt(t['liq_price'])}\n"
@@ -2873,7 +2875,7 @@ class Bot:
             f"Net P/L: ${net:+.2f} (Rs {self.inr(net):+.0f})  [{r_mult:+.2f}R]"
             + (f" · {pct_text(pnl_pct_m)}" if pnl_pct_m is not None else "")
             + (f" · price {(exit_px / t['entry'] - 1) * 100:+.2f}%" if t.get("strategy") in ("rsi1h", "ema20") else "")
-            + (f"\nExit: {t['extra']['ema_exit']}" if res["reason"] == "EMA_EXIT" and (t.get("extra") or {}).get("ema_exit") else "")
+            + (f"\nExit: {t['extra']['ema_exit']}" if res["reason"] in ("EMA_EXIT", "PB_CLOSE") and (t.get("extra") or {}).get("ema_exit") else "")
             + "\n"
             f"Duration: {human_dur(res['ts'] - t['opened_ts'])}\n"
             + (f"{execution.exit_text(xx, fmt)}\n" if xx else "") +

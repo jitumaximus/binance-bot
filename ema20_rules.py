@@ -7,7 +7,9 @@ LONG (SHORT is the exact mirror):
     candle's high (the higher high if both are red).
  3. From the 3rd candle on, armed: enter as soon as price trades above the trigger. Cancelled if a 5m candle closes
     below the 20 EMA first, or after max_wait candles without a breach.
- 4. 1R = entry - lowest low of the alert and pullback candles, at least min_r_pct of the price.
+ 4. Stop (28 Nov 2026): a 5m candle CLOSING below the pullback level = the red pullback candle's low (the lower
+    low if both are red); short: closing above the green pullback candle's high (the higher high). ema20.py also
+    keeps the 3% hard stop; 1R = entry - the closer of the two, at least min_r_pct of the price.
 EMA: 20-period EMA of the 5m closes, seeded with the first close; the first `warm` candles are warm-up only.
 """
 
@@ -47,8 +49,8 @@ def closes_against(c, e, side):
 
 def scan_setups(cands, side, max_wait=12, min_r_pct=0.002, n=EMA_LEN, warm=WARM):
     """Walk ascending CLOSED 5m candles and return every setup, oldest first. Each setup:
-      alert_i, alert_time, pull (2 candle times), status, trigger, low (lowest low / highest high), r (price units, at
-      the trigger as a stand-in for the entry), ema (at the alert), armed_i / armed_time (close of the 2nd pullback
+      alert_i, alert_time, pull (2 candle times), status, trigger, low (lowest low / highest high of the alert and
+      pullback candles), pb (the pullback stop level), r (trigger - pb, at least min_r_pct), ema (at the alert), armed_i / armed_time (close of the 2nd pullback
       candle; armed from the next candle), end_i / end_time, reason.
     status: 'pullback' (waiting for the 2nd pullback candle), 'failed' (no valid pullback), 'armed' (still waiting at
     the last candle), 'breached' (a later candle traded beyond the trigger: an entry), 'cancelled' (closed against the
@@ -77,8 +79,9 @@ def scan_setups(cands, side, max_wait=12, min_r_pct=0.002, n=EMA_LEN, warm=WARM)
                         trig = max(x["high"] for x in against) if side == "long" else min(x["low"] for x in against)
                         grp = cands[cur["alert_i"]:i + 1]
                         low = min(x["low"] for x in grp) if side == "long" else max(x["high"] for x in grp)
-                        r = max(abs(trig - low), trig * min_r_pct)
-                        cur.update(status="armed", trigger=trig, low=low, r=r, armed_i=i, armed_time=c["time"])
+                        pb = min(x["low"] for x in against) if side == "long" else max(x["high"] for x in against)
+                        r = max(abs(trig - pb), trig * min_r_pct)      # at the trigger; ema20.py recomputes at entry
+                        cur.update(status="armed", trigger=trig, low=low, pb=pb, r=r, armed_i=i, armed_time=c["time"])
                 if cur["status"] != "failed":
                     continue
             elif cur["status"] == "armed":

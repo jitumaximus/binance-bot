@@ -54,8 +54,8 @@ class Rules(unittest.TestCase):
         self.assertLess(c[-4]["close"], ema[-4])                  # before the alert: under the EMA
         self.assertTrue(E.is_alert(c, ema, len(c) - 3, "long"))
         s = self.last(c)
-        self.assertEqual((s["status"], s["trigger"], s["low"]), ("armed", 99.7, 97.7))
-        self.assertAlmostEqual(s["r"], 99.7 - 97.7)
+        self.assertEqual((s["status"], s["trigger"], s["low"], s["pb"]), ("armed", 99.7, 97.7, 99.1))
+        self.assertAlmostEqual(s["r"], 99.7 - 99.1)                        # trigger - the red pullback low
         self.assertEqual(s["pull"], [c[-2]["time"], c[-1]["time"]])
 
     def test_breach(self):
@@ -93,10 +93,11 @@ class Rules(unittest.TestCase):
         add(c, (97.8, 99.6, 97.7, 99.5), (99.5, 99.6, 97.0, 97.1))
         self.assertEqual(self.last(c)["status"], "failed")
 
-    def test_higher_high_of_two_red_pullbacks(self):
+    def test_two_red_pullbacks_higher_high_and_lower_low(self):
         c = base()
-        add(c, (97.8, 99.6, 97.7, 99.5), (99.5, 99.7, 99.1, 99.2), (99.4, 99.9, 99.1, 99.3))
-        self.assertEqual(self.last(c)["trigger"], 99.9)
+        add(c, (97.8, 99.6, 97.7, 99.5), (99.5, 99.7, 99.0, 99.2), (99.4, 99.9, 99.1, 99.3))
+        s = self.last(c)
+        self.assertEqual((s["trigger"], s["pb"]), (99.9, 99.0))
 
     def test_min_r(self):
         c = base()
@@ -111,6 +112,7 @@ class Rules(unittest.TestCase):
         self.assertEqual(s["status"], "breached")
         self.assertAlmostEqual(s["trigger"], 200 - 99.7)
         self.assertAlmostEqual(s["low"], 200 - 97.7)              # highest high for a short
+        self.assertAlmostEqual(s["pb"], 200 - 99.1)               # the green pullback candle's high
         self.assertEqual(E.scan_setups(c, "long")[-1:] and E.scan_setups(c, "long")[-1]["status"] or "none",
                          E.scan_setups(c, "long")[-1]["status"] if E.scan_setups(c, "long") else "none")
 
@@ -165,7 +167,8 @@ class Live(unittest.TestCase):
         self.e.poll(bar + 23)
         t = self.b.book("EMA20 PULLBACK")["open_trade"]
         self.assertEqual((t["symbol"], t["side"], t["strategy"], t["book"]), (self.SYM, "long", "ema20", "EMA20 PULLBACK"))
-        self.assertAlmostEqual(t["risk0"], t["entry"] - 97.7)                # 1R from the setup's lowest low
+        self.assertAlmostEqual(t["risk0"], t["entry"] - 99.1)                # 1R to the pullback low (closer than 3%)
+        self.assertEqual(t["extra"]["pb"], 99.1)
         self.assertAlmostEqual(t["stop"], t["hard_stop"])                    # initial stop = the 3% hard stop
         self.assertAlmostEqual(t["hard_stop"], t["entry"] * 0.97, delta=0.011)
         self.assertGreater(t["margin"], 99)                                  # the whole $100 book
@@ -189,15 +192,63 @@ class Live(unittest.TestCase):
         self.close(c)
         self.assertEqual(self.b.book_trades("EMA20 PULLBACK"), [])
         x = self.ev("EXIT")[-1]
-        self.assertEqual((x["reason"], x["book"]), ("EMA_EXIT", "EMA20 PULLBACK"))
+        self.assertEqual((x["reason"], x["book"]), ("PB_CLOSE", "EMA20 PULLBACK"))   # under both: the pullback stop
         with open(os.path.join(self.d, "trades.csv"), newline="") as fh:
             tr = list(csv.DictReader(fh))[-1]
-        self.assertEqual((tr["strategy"], tr["exit_reason"]), ("EMA20 PULLBACK", "EMA_EXIT"))
+        self.assertEqual((tr["strategy"], tr["exit_reason"]), ("EMA20 PULLBACK", "PB_CLOSE"))
         self.assertIn("crossed the 20 EMA", tr["setup"])
         self.assertTrue(tr["pnl_pct_margin"])
         msg = next(m for m in self.sent if m.startswith("TRADE CLOSED"))
         self.assertIn("Exit: 5m", msg)
-        self.assertIn("below the 20 EMA", msg)
+        self.assertIn("below the pullback low", msg)
+
+    def test_ema_close_exit_when_the_pullback_low_is_under_the_ema(self):
+        c = base()
+        add(c, (97.8, 99.6, 97.7, 99.5), (99.5, 99.7, 98.0, 99.2), (99.2, 99.4, 99.0, 99.3))   # red low 98.0
+        self.close(c)
+        self.fd.px[self.SYM] = 99.75
+        self.e.poll(c[-1]["time"] + P + 20)
+        t = self.b.book("EMA20 PULLBACK")["open_trade"]
+        t["opened_ts"] = c[-1]["time"] + P + 30
+        add(c, (99.6, 99.7, 98.2, 98.3))
+        ema = __import__("ema20_rules").ema_series([x["close"] for x in c])
+        self.assertTrue(98.0 < 98.3 < ema[-1])                                  # under the EMA, over the pullback low
+        self.fd.px[self.SYM] = 98.3
+        self.close(c)
+        self.assertEqual(self.ev("EXIT")[-1]["reason"], "EMA_EXIT")
+        self.assertIn("below the 20 EMA", next(m for m in self.sent if m.startswith("TRADE CLOSED")))
+
+    def enter_long(self):
+        c, bar = self.arm()
+        self.fd.px[self.SYM] = 99.75
+        self.e.poll(bar + 23)
+        t = self.b.book("EMA20 PULLBACK")["open_trade"]
+        t["opened_ts"] = c[-1]["time"] + P + 30
+        return c, t
+
+    def test_pullback_close_exits_wicks_do_not(self):
+        c, t = self.enter_long()
+        add(c, (99.6, 99.8, 98.9, 99.5))                                     # wick under 99.1, close above: hold
+        self.close(c)
+        self.assertEqual(len(self.b.book_trades("EMA20 PULLBACK")), 1)
+        ema = __import__("ema20_rules").ema_series([x["close"] for x in add(c, (99.5, 99.6, 98.95, 99.0))])
+        self.assertGreater(99.0, ema[-1])                                     # above the EMA, below the pullback low
+        self.fd.px[self.SYM] = 99.0
+        self.close(c)
+        self.assertEqual(self.b.book_trades("EMA20 PULLBACK"), [])
+        self.assertEqual(self.ev("EXIT")[-1]["reason"], "PB_CLOSE")
+        msg = next(m for m in self.sent if m.startswith("TRADE CLOSED"))
+        self.assertIn("below the pullback low 99.1", msg)
+
+    def test_r_capped_by_the_hard_stop(self):
+        c = base()
+        add(c, (97.8, 99.6, 97.7, 99.5), (99.5, 99.7, 95.0, 99.2), (99.2, 99.4, 99.0, 99.3))  # red low 95: > 3% away
+        self.close(c)
+        self.fd.px[self.SYM] = 99.75
+        self.e.poll(c[-1]["time"] + P + 20)
+        t = self.b.book("EMA20 PULLBACK")["open_trade"]
+        self.assertAlmostEqual(t["risk0"], t["entry"] - t["hard_stop"])
+        self.assertIn("to the hard stop", t["extra"]["detail"])
 
     def test_breach_only_on_a_closed_candle_cancels(self):
         c, bar = self.arm()
@@ -240,7 +291,7 @@ class Live(unittest.TestCase):
                          "EMA20 PULLBACK has 1")
         bk["open_trade"] = None
         self.e.st["armed"][f"{self.SYM}|long"] = dict(self.e.arm_record(self.SYM, "long", {
-            "trigger": 99.7, "low": 97.7, "r": 2.0, "ema": 98.3, "alert_time": 1, "pull": [2, 3], "armed_time": 3}))
+            "trigger": 99.7, "low": 97.7, "pb": 99.1, "r": 0.6, "ema": 98.3, "alert_time": 1, "pull": [2, 3], "armed_time": 3}))
         self.fd.depth_qty = 0.05                                              # thin book: impact limit << 25%
         self.e.poll(bar + 26)
         self.assertEqual(self.ev("EMA20_SKIP")[-1]["reason"][:9], "too small")

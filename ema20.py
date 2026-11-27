@@ -19,11 +19,15 @@ ENTRY     price beyond the trigger -> capped IOC limit entry through the bot's e
           book, liquidation beyond the stop, a coin held by one book at most. Several breaches at one check: highest
           24h volume first. A setup is used once (a breach that is skipped is not retried). A breach seen only on a
           closed candle (between two price checks, or while the bot was down) cancels the setup: no late entry.
-R         1R = entry - lowest low of the alert and pullback candles (short: highest high - entry), at least
-          EMA20_MIN_R_PCT (0.2%) of the entry. R sets breakeven and the trail; it is not a stop by itself.
+STOP      (28 Nov 2026) the pullback level: the red pullback candle's low (the lower low if both are red); short: the
+          green pullback candle's high (the higher high). It works on 5m CLOSES: a 5m candle closing beyond it exits
+          at market right after that close (PB_CLOSE); wicks through it don't count. The 3% hard stop always applies
+          on the price (the trade's price stop until breakeven).
+R         1R = entry - the closer of the pullback level and the 3% hard stop, at least EMA20_MIN_R_PCT (0.2%) of the
+          entry. R sets breakeven and the trail.
 EXITS     (market) whichever comes first:
-          - a 5m candle closes back through the 20 EMA (below for a long, above for a short): exit right after that
-            close (EMA_EXIT), the entry candle included;
+          - a 5m candle closes beyond the pullback level (PB_CLOSE), or back through the 20 EMA (EMA_EXIT; below for
+            a long, above for a short): exit right after that close, the entry candle included;
           - breakeven at 1R, then from 3R the stop trails at (floor(best R) - 1) x R (checked on 1m candles, like the
             1H RSI books);
           - the 3% hard stop (HARD_STOP_PCT), always: it is the initial stop.
@@ -102,8 +106,9 @@ class Ema20:
     def startup_line(self):
         c = self.c
         return (f"\nEMA20 PULLBACK [PAPER]: ON | ${self.b.book(BOOK)['balance']:.2f} | sides {'/'.join(c['sides'])} | "
-                f"5m 20 EMA cross + 2-candle pullback, trigger break within {c['max_wait']} candles | 1R >= "
-                f"{c['min_r_pct'] * 100:g}% | exit on a 5m close back through the EMA, BE {c['be_r']:g}R, trail from "
+                f"5m 20 EMA cross + 2-candle pullback, trigger break within {c['max_wait']} candles | stop: 5m close "
+                f"beyond the pullback candle or the hard stop, 1R to the closer (>= {c['min_r_pct'] * 100:g}%) | exit "
+                f"on a 5m close back through the EMA, BE {c['be_r']:g}R, trail from "
                 f"{c['trail_start_r']:g}R, hard stop {c['hard_stop'] * 100:g}% | size as the 1H RSI books")
 
     # ---- universe ----
@@ -218,7 +223,7 @@ class Ema20:
                         armed[key] = self.arm_record(sym, side, s)
                         a = armed[key]
                         self.b.event("EMA20_ARMED", book=BOOK, side=side, symbol=sym, trigger=a["trigger"],
-                                     low=a["low"], r=a["r"], r_pct=a["r_pct"], ema=a["ema"], alert=ist(a["alert_time"]),
+                                     pullback_stop=a["pb"], low=a["low"], r=a["r"], r_pct=a["r_pct"], ema=a["ema"], alert=ist(a["alert_time"]),
                                      pullback=[ist(x) for x in a["pull"]], expires=ist(a["expires"]))
                     if cur and s["alert_time"] == cur["alert_time"]:
                         seen.add(key)
@@ -251,7 +256,7 @@ class Ema20:
                  hm(last_t), len(res), job["n"], job["errors"], job["took"], n_alert, n_armed, len(armed), n_cancel)
 
     def arm_record(self, sym, side, s):
-        return {"symbol": sym, "side": side, "trigger": s["trigger"], "low": s["low"], "r": s["r"],
+        return {"symbol": sym, "side": side, "trigger": s["trigger"], "low": s["low"], "pb": s["pb"], "r": s["r"],
                 "r_pct": round(s["r"] / s["trigger"] * 100, 3), "ema": round(s["ema"], 10),
                 "alert_time": s["alert_time"], "pull": s["pull"][:2], "armed_time": s["armed_time"],
                 "expires": s["armed_time"] + self.c["max_wait"] * P5M,
@@ -353,20 +358,25 @@ class Ema20:
         cand["size"] = qty
         hard = R.hard_stop_for(side, entry, tick, c["hard_stop"])
         liq = R.round_tick(R.liq_price(side, entry, lev, c["mmr"]), tick, "nearest")
-        r = max(abs(entry - a["low"]), entry * c["min_r_pct"])
+        pb = a["pb"]
+        if (side == "long" and pb >= entry) or (side == "short" and pb <= entry):
+            return self.skip(sig, f"entry {entry:g} is already beyond the pullback stop {pb:g}", "price past stop")
+        r = max(min(abs(entry - pb), abs(entry - hard)), entry * c["min_r_pct"])
+        r_src = "pullback" if abs(entry - pb) <= abs(entry - hard) else "hard stop"
         loss_usd, loss_pct = R.loss_if_stopped(side, qty, entry, hard, b.cfg["fee_pct_per_side"], equity)
         cand.update(stop_used=hard, stop_pct=abs(entry - hard) / entry * 100, hard_stop=hard, liq_price=liq,
-                    loss_pct_if_stopped=round(loss_pct, 2), r_pct=round(r / entry * 100, 3))
+                    loss_pct_if_stopped=round(loss_pct, 2), r_pct=round(r / entry * 100, 3), stop_candle=pb)
         info.update(notional=qty * entry, risk_usd=qty * abs(entry - hard), margin=qty * entry / lev)
         x = tx["exec"]
         detail = (f"{'green' if side == 'long' else 'red'} alert {hm(a['alert_time'])} crossed the 20 EMA "
                   f"({a['ema']:.6g}); pullback {', '.join(hm(t) for t in a['pull'])}; trigger {a['trigger']:g} "
-                  f"(armed {hm(a['armed_time'] + P5M)}, expires {hm(a['expires'] + P5M)}) | 1R {r:.6g} = "
-                  f"{r / entry * 100:.2f}% (entry vs {'lowest low' if side == 'long' else 'highest high'} {a['low']:g}"
-                  f"{', min ' + format(c['min_r_pct'] * 100, 'g') + '%' if r > abs(entry - a['low']) + 1e-12 else ''})"
-                  f" | hard stop {hard:g} ({c['hard_stop'] * 100:g}%) | exit on a 5m close "
-                  f"{'below' if side == 'long' else 'above'} the 20 EMA, BE {c['be_r']:g}R, trail from "
-                  f"{c['trail_start_r']:g}R"
+                  f"(armed {hm(a['armed_time'] + P5M)}, expires {hm(a['expires'] + P5M)}) | stop: a 5m close "
+                  f"{'below' if side == 'long' else 'above'} the pullback {'low' if side == 'long' else 'high'} {pb:g} "
+                  f"({abs(entry - pb) / entry * 100:.2f}%) or the hard stop {hard:g} ({c['hard_stop'] * 100:g}%) | 1R "
+                  f"{r:.6g} = {r / entry * 100:.2f}% (to the {r_src}"
+                  f"{', min ' + format(c['min_r_pct'] * 100, 'g') + '%' if r > min(abs(entry - pb), abs(entry - hard)) + 1e-12 else ''})"
+                  f" | also exits on a 5m close {'below' if side == 'long' else 'above'} the 20 EMA, BE {c['be_r']:g}R, "
+                  f"trail from {c['trail_start_r']:g}R"
                   f" | fill {qty:g}/{x['qty_intended']:g} @ {entry:g} (ref {x['entry_ref']:g}, cap {x['entry_cap']:g}, "
                   f"{x['entry_children']} IOC, slippage {x['entry_slip_pct']:+.3f}% = ${x['entry_slip_usd']:.4f}"
                   + (", price-impact limit" if x["liq_capped"] == "yes" else "") + ")"
@@ -375,7 +385,7 @@ class Ema20:
         t = {"mode": b.cfg["mode"], "book": BOOK, "side": side, "symbol": sym, "product_id": p["id"],
              "contracts": n, "cv": p["cv"], "tick": tick, "entry": entry, "stop": hard, "tp": None,
              "signal_close": sig["ltp"], "rsi": None, "strategy": "ema20",
-             "extra": {"detail": detail, "trigger": a["trigger"], "low": a["low"], "r": r, "ema": a["ema"],
+             "extra": {"detail": detail, "trigger": a["trigger"], "low": a["low"], "pb": pb, "r": r, "ema": a["ema"],
                        "alert_time": a["alert_time"], "pull": a["pull"], "last_price": sig["ltp"],
                        "target_qty": info["target_qty"], "impact_qty": info["impact_qty"],
                        "size_binding": info["binding"], "free_margin": round(free, 4)},
@@ -411,12 +421,19 @@ class Ema20:
             if cand[-1]["time"] + P5M <= (t.get("opened_ts") or 0):
                 continue                            # the trade opened after this candle closed
             e = E.ema_at_last(cand)
-            if e is None or not E.closes_against(cand[-1], e, t["side"]):
+            last, long_ = cand[-1], t["side"] == "long"
+            pb = (t.get("extra") or {}).get("pb")
+            below = "below" if long_ else "above"
+            if pb is not None and ((last["close"] < pb) if long_ else (last["close"] > pb)):
+                reason, why = "PB_CLOSE", (f"5m {hm(last['time'])} closed {last['close']:g} {below} the pullback "
+                                           f"{'low' if long_ else 'high'} {pb:g}")
+            elif e is not None and E.closes_against(last, e, t["side"]):
+                reason, why = "EMA_EXIT", f"5m {hm(last['time'])} closed {last['close']:g} {below} the 20 EMA {e:.6g}"
+            else:
                 continue
             px = self.b.last_price(t["symbol"])
-            t.setdefault("extra", {})["ema_exit"] = (f"5m {hm(cand[-1]['time'])} closed {cand[-1]['close']:g} "
-                                                     f"{'below' if t['side'] == 'long' else 'above'} the 20 EMA {e:.6g}")
-            self.b.close_trade(t, {"reason": "EMA_EXIT", "price": px, "ts": int(now), "estimated": True})
+            t.setdefault("extra", {})["ema_exit"] = why
+            self.b.close_trade(t, {"reason": reason, "price": px, "ts": int(now), "estimated": True})
 
     # ---- candidates.csv ----
     def candidate(self, sig, rank, now):
@@ -432,7 +449,8 @@ class Ema20:
                    "ref_time": ist(a["alert_time"]), "stop_used": c.get("stop_used"),
                    "stop_pct": round(c["stop_pct"], 3) if c.get("stop_pct") is not None else None,
                    "size": c.get("size"), "vol24h_usdt": round(a["vol24h"]) if a.get("vol24h") else None,
-                   "rank_by": "volume", "ema20": a["ema"], "r_pct": c.get("r_pct", a["r_pct"])}
+                   "rank_by": "volume", "ema20": a["ema"], "r_pct": c.get("r_pct", a["r_pct"]),
+                   "stop_candle": a.get("pb")}
             x = c.get("exec") or {}
             row.update({k: x.get(k) for k in ("depth5_qty", "liq_cap_qty", "liq_capped", "entry_ref", "entry_cap",
                                               "entry_avg", "entry_slip_pct", "entry_children", "qty_intended",
@@ -456,5 +474,6 @@ class Ema20:
         armed = sorted(self.st["armed"].values(), key=lambda a: -(a.get("vol24h") or 0))
         return ([f"EMA20 PULLBACK: armed {len(armed)}"
                  + (f" | last 5m check {hm(self.st['last_bar'] - P5M)}" if self.st["last_bar"] else "")]
-                + [f"  {a['side'].upper()} {a['symbol']} trigger {a['trigger']:g} (1R {a['r_pct']:.2f}%), "
+                + [f"  {a['side'].upper()} {a['symbol']} trigger {a['trigger']:g}, pullback stop {a['pb']:g} "
+                   f"(1R {a['r_pct']:.2f}%), "
                    f"until {hm(a['expires'] + P5M)}" for a in armed[:6]])
