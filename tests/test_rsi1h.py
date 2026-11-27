@@ -348,7 +348,7 @@ class Runner(unittest.TestCase):
         self.assertAlmostEqual(t["contracts"] * t["cv"], 2.5)                  # the 0.05% impact limit binds
         self.assertEqual(t["extra"]["size_binding"], "price impact")
         self.assertAlmostEqual(t["margin"], 2.5 * t["entry"] / 20)
-        self.assertAlmostEqual(t["hard_stop"], R.round_tick(t["entry"] * 1.03, t["tick"], "up"))
+        self.assertAlmostEqual(t["hard_stop"], R.round_tick(t["entry"] * 1.015, t["tick"], "up"))   # 1.5% (28 Nov)
         self.assertGreater(t["liq_price"], t["stop"])
         usd, pct = R.loss_if_stopped("short", 2.5, t["entry"], t["stop"], 0.05, t["equity"])
         self.assertAlmostEqual(t["loss_if_stopped_pct"], round(pct, 2))

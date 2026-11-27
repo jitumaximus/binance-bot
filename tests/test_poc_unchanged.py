@@ -21,6 +21,9 @@ POC_BASELINE = "1536659"
 HOOKS = {"make_cfg", "book_for", "Bot.__init__", "Bot.enabled_books", "Bot.check_exit_by_candles",
          "Bot.finish_entry", "Bot.close_trade", "Bot.status_text", "Bot.strategy_desc", "Bot.startup", "Bot.tick",
          "Binance.request",
+         # 28 Nov 2026: the breakeven message uses the trade's own be_r (4H RETRACE: 2R); POC trades have none and
+         # keep BE_TRIGGER_R, so POC's message is unchanged (test_poc_paper_trade_identical)
+         "Bot.notify_be",
          # entry execution (25 Nov 2026): try_enter changes only after POC's `if sig.get("limit"): return` (the
          # non-POC paper fill); enter_live only for the non-POC books; IOC reply type; depth limit (POC keeps 100)
          "Bot.try_enter", "Bot.enter_live", "Binance.orderbook", "Binance.place_order",
@@ -38,7 +41,8 @@ ADDED = {"Bot.paused_books", "Bot.poc_pause_step",          # POC_ENABLED=0 paus
          "Bot.trade_status_line", "Bot.rsi1h_loss_pct",     # /status per trade (26 Nov 2026, sizing v2)
          "usd",                                             # exit slippage vs stop + vs book (26 Nov 2026)
          "Bot.margin_pcts", "pct_text", "stop_text",        # 1H RSI % on margin in /status (27 Nov 2026)
-         "Bot.manage_ema20_paper"}                          # EMA20 PULLBACK paper exits (28 Nov 2026)
+         "Bot.manage_ema20_paper",                          # EMA20 PULLBACK paper exits (28 Nov 2026)
+         "Bot.all_prices"}                                  # one price snapshot for EMA20 / 4H RETRACE (28 Nov 2026)
 POC_FUNCS = ("Bot.tick_poc", "Bot.poc_pending_step", "Bot.poc_filled", "Bot.poc_place_limit", "Bot.poc_cancel",
              "Bot.poc_take_at_poc", "Bot.build_pocs", "Bot.poc_tier1", "Bot.manage_poc_live", "Bot.touch_stop_price",
              "Bot.set_touch_stop", "Bot.apply_trail", "Bot.apply_be", "Bot.entry_allowed",
@@ -46,7 +50,7 @@ POC_FUNCS = ("Bot.tick_poc", "Bot.poc_pending_step", "Bot.poc_filled", "Bot.poc_
              "Bot.manage_open_trade", "Bot.run", "poc_price", "size_trade", "size_by_margin")
 ENV = {"EXCHANGE": "binance", "DRY_RUN": "1", "ENABLE_POC": "1", "ENABLE_SHORT": "0", "ENABLE_LONG": "0",
        "ENABLE_BREAKOUT": "0", "POC_SKIP_US_SESSION": "1", "START_CAPITAL_INR": "11890", "USD_INR_RATE": "85",
-       "RSI1H_ENABLED": "0", "EMA20_ENABLED": "0"}
+       "RSI1H_ENABLED": "0", "EMA20_ENABLED": "0", "RETRACE_ENABLED": "0"}
 CLEAR = ("ENABLE_BOOKJUMP", "BJ_ENABLED", "POC_ENABLED")
 PROD = {"id": 1, "symbol": "BTCUSDT", "tick": 0.1, "cv": 0.001, "type": "perpetual_futures", "stock_token": False}
 
@@ -150,6 +154,7 @@ class PocUnchanged(unittest.TestCase):
         old, new = self.old.make_cfg(), self.new.make_cfg()
         self.assertEqual(new.pop("enable_rsi1h"), False)
         self.assertEqual(new.pop("enable_ema20"), False)            # EMA20 PULLBACK (28 Nov 2026), off here
+        self.assertEqual(new.pop("enable_retrace"), False)          # 4H RETRACE (28 Nov 2026), off here
         self.assertEqual(new.pop("poc_paused"), False)              # POC_ENABLED unset = running
         for k, v in (("entry_slip_cap_pct", 0.001), ("liq_cap_pct", 0.3), ("entry_max_children", 20),
                      ("exit_slip_cap_pct", 0.001), ("exit_guard_r", 0.5), ("exit_max_children", 20)):

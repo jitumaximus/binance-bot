@@ -33,7 +33,7 @@ ENTRY     market at the start of the next candle (the check ~8 s after the close
 STOP      1 tick (STOP_BUFFER_TICKS) beyond the divergence candle's high (short) / low (long), at least
           RSI1H_MIN_STOP_PCT (0.5%) from entry (widened and logged if closer). Signals whose stop is more than
           MAX_STOP_PCT (3%) from the entry are skipped ("stop too wide"). Every trade also has a hard stop HARD_STOP_PCT
-          (3%) against the entry; the active stop is whichever is closer to the entry (paper: simulated; exit reason
+          (1.5% since 28 Nov 2026, 3% before; shared by all six books) against the entry; the active stop is whichever is closer to the entry (paper: simulated; exit reason
           HARD_STOP when the hard stop was the active one). The books refuse to run live, so no exchange STOP_MARKET is
           placed yet: wire one in before any live switch.
 LIQ       isolated 20x: liquidation = entry x (1 - 1/lev) / (1 - mmr) long, entry x (1 + 1/lev) / (1 + mmr) short,
@@ -95,7 +95,7 @@ def load_cfg(env=None):
         "max_open": int(f("MAX_OPEN_TRADES", 3)),         # open trades per book
         "min_trade_margin": f("MIN_TRADE_MARGIN_PCT", 0.25),  # 27 Nov 2026: skip trades with margin < 25% of the book
         "max_stop": f("MAX_STOP_PCT", 0.03),              # skip signals whose stop is further than 3%
-        "hard_stop": f("HARD_STOP_PCT", 0.03),            # protective stop 3% against the entry
+        "hard_stop": f("HARD_STOP_PCT", 0.015),           # protective stop 1.5% against the entry (3% until 28 Nov 2026)
         "mmr": f("RSI1H_MMR", 0.01),                      # maintenance margin rate for the liquidation price
         "book_depth": int(f("RSI1H_BOOK_DEPTH", 50)),     # order-book levels walked (50 = request weight 2)
         "overbought": f("RSI1H_OVERBOUGHT", 70),

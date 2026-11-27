@@ -1,5 +1,7 @@
 """
-EMA20 PULLBACK - one $100 book (both sides) on Binance USDT-M perpetuals. PAPER ONLY (refuses live, like rsi1h.py).
+EMA20 LONG / EMA20 SHORT - two $100 books (one per side; until 28 Nov 2026 one book, EMA20 PULLBACK) on Binance
+USDT-M perpetuals. PAPER ONLY (refuses live, like rsi1h.py). Each book has its own margin, max 3 trades, leftover and
+25%-minimum rules; armed setups are shared state, each traded by its side's book.
 =====================================================================================================================
 Started by bot.py when EMA20_ENABLED=1 (default) in paper mode on EXCHANGE=binance. Setup rules: ema20_rules.py.
 
@@ -22,8 +24,8 @@ ENTRY     price beyond the trigger -> capped IOC limit entry through the bot's e
 STOP      (28 Nov 2026) the pullback level: the red pullback candle's low (the lower low if both are red); short: the
           green pullback candle's high (the higher high). It works on 5m CLOSES: a 5m candle closing beyond it exits
           at market right after that close (PB_CLOSE); wicks through it don't count. The hard stop always applies
-          on the price (the trade's price stop until breakeven): EMA20_HARD_STOP_PCT, 1.5% (3% until 27 Nov 2026 22:1x
-          IST; the 1H RSI books keep HARD_STOP_PCT 3%).
+          on the price (the trade's price stop until breakeven): HARD_STOP_PCT 1.5% for every book since 28 Nov 2026
+          (EMA20_HARD_STOP_PCT overrides it for these books).
 R         1R = entry - the closer of the pullback level and the hard stop, at least EMA20_MIN_R_PCT (0.2%) of the
           entry. R sets breakeven and the trail.
 EXITS     (market) whichever comes first:
@@ -46,8 +48,12 @@ import rsi1h as R
 
 log = logging.getLogger("bot")
 IST = ZoneInfo("Asia/Kolkata")
-BOOK = "EMA20 PULLBACK"
-BOOKS = (BOOK,)
+LONG_BOOK, SHORT_BOOK = "EMA20 LONG", "EMA20 SHORT"     # one book per side since 28 Nov 2026 (was EMA20 PULLBACK)
+BOOKS = (LONG_BOOK, SHORT_BOOK)
+
+
+def book_of(side):
+    return LONG_BOOK if side == "long" else SHORT_BOOK
 P5M = 300
 N_CANDLES = 98                      # +1 in candles() = 99: weight 1 per symbol
 
@@ -69,7 +75,7 @@ def load_cfg(env=None):
              check_delay=f("EMA20_CHECK_DELAY_SEC", 8), poll_sec=f("EMA20_POLL_SEC", 3),
              fetch_workers=int(f("EMA20_FETCH_WORKERS", 4)), be_r=f("EMA20_BE_R", 1),
              trail_start_r=f("EMA20_TRAIL_START_R", 3),
-             hard_stop=f("EMA20_HARD_STOP_PCT", 0.015))    # 28 Nov 2026: 1.5% for this book (1H RSI books keep 3%)
+             hard_stop=f("EMA20_HARD_STOP_PCT", c["hard_stop"]))   # default: the shared HARD_STOP_PCT (1.5%)
     return c
 
 
@@ -96,18 +102,21 @@ class Ema20:
 
     # ---- books ----
     def ensure_books(self):
-        books = self.b.state["books"]
-        if BOOK not in books:
-            bk = self.b.new_book(round(self.c["start_balance"], 4))
-            bk["since"] = datetime.now(IST).isoformat(timespec="seconds")
-            books[BOOK] = bk
+        books, made = self.b.state["books"], []
+        for name in BOOKS:
+            if name not in books:
+                bk = self.b.new_book(round(self.c["start_balance"], 4))
+                bk["since"] = datetime.now(IST).isoformat(timespec="seconds")
+                books[name] = bk
+                made.append(name)
+        if made:
             self.b.save_state()
-            return [BOOK]
-        return []
+        return made
 
     def startup_line(self):
         c = self.c
-        return (f"\nEMA20 PULLBACK [PAPER]: ON | ${self.b.book(BOOK)['balance']:.2f} | sides {'/'.join(c['sides'])} | "
+        return (f"\nEMA20 LONG / EMA20 SHORT [PAPER]: ON | ${self.b.book(LONG_BOOK)['balance']:.2f} / "
+                f"${self.b.book(SHORT_BOOK)['balance']:.2f} | sides {'/'.join(c['sides'])} | "
                 f"5m 20 EMA cross + 2-candle pullback, trigger break within {c['max_wait']} candles | stop: 5m close "
                 f"beyond the pullback candle or the hard stop, 1R to the closer (>= {c['min_r_pct'] * 100:g}%) | exit "
                 f"on a 5m close back through the EMA, BE {c['be_r']:g}R, trail from "
@@ -146,17 +155,21 @@ class Ema20:
             if res is not None:
                 self.on_close(now, bar_j, res)
         if (self.st["armed"] and now - self.last_poll >= self.c["poll_sec"] and not self.b.state.get("paused")
-                and self.has_room()):
+                and any(self.has_room(sd) for sd in {a["side"] for a in self.st["armed"].values()})):
             self.last_poll = now
             try:
                 self.poll(now)
             except Exception:  # noqa: BLE001
                 log.exception("EMA20 price poll failed")
 
-    def has_room(self):
-        """Prices are only watched while the book could take a trade (as the 1H RSI books skip their checks)."""
-        return (len(self.b.book_trades(BOOK)) < self.c["max_open"]
-                and R.avail_margin(self.b, BOOK, self.c["min_trade_margin"])[1] is None)
+    def has_room(self, side):
+        """Prices are only watched while a side's book could take a trade (as the 1H RSI books skip their checks)."""
+        book = book_of(side)
+        return (len(self.b.book_trades(book)) < self.c["max_open"]
+                and R.avail_margin(self.b, book, self.c["min_trade_margin"])[1] is None)
+
+    def all_trades(self):
+        return [t for bk in BOOKS for t in self.b.book_trades(bk)]
 
     # ---- 5m close: candles for the universe in the background ----
     def start_fetch(self, now, bar):
@@ -164,7 +177,7 @@ class Ema20:
         if not prods:
             return
         armed = {k.split("|")[0] for k in self.st["armed"]}
-        held = {t["symbol"] for t in self.b.book_trades(BOOK)}
+        held = {t["symbol"] for t in self.all_trades()}
         syms = sorted(held) + sorted(armed - held) + sorted(set(prods) - armed - held)
         self.job = (bar, self.pool.submit(self.fetch_all, syms, bar, now))
 
@@ -211,7 +224,7 @@ class Ema20:
         res, armed, used = job["res"], self.st["armed"], self.st["used"]
         n_alert = n_armed = n_cancel = 0
         seen, alerts = set(), {"long": [], "short": []}
-        room = self.has_room()
+        room = {sd: self.has_room(sd) for sd in ("long", "short")}
         for sym, sides in res.items():
             for side, sets in sides.items():
                 key = f"{sym}|{side}"
@@ -224,14 +237,14 @@ class Ema20:
                         n_armed += 1
                         armed[key] = self.arm_record(sym, side, s)
                         a = armed[key]
-                        self.b.event("EMA20_ARMED", book=BOOK, side=side, symbol=sym, trigger=a["trigger"],
+                        self.b.event("EMA20_ARMED", book=book_of(side), side=side, symbol=sym, trigger=a["trigger"],
                                      pullback_stop=a["pb"], low=a["low"], r=a["r"], r_pct=a["r_pct"], ema=a["ema"], alert=ist(a["alert_time"]),
                                      pullback=[ist(x) for x in a["pull"]], expires=ist(a["expires"]))
                     if cur and s["alert_time"] == cur["alert_time"]:
                         seen.add(key)
                         if s["status"] in ("cancelled", "expired", "breached"):
                             why = (s["reason"] if s["status"] != "breached" else
-                                   "the trigger traded while the book had no room: no entry" if not room else
+                                   "the trigger traded while the book had no room: no entry" if not room[side] else
                                    "the trigger traded between two price checks (closed-candle high/low): no late entry")
                             self.cancel(key, why)
                             n_cancel += 1
@@ -248,7 +261,7 @@ class Ema20:
                 self.cancel(key, "setup no longer found in the candles")
                 n_cancel += 1
         if n_alert:                     # one event per 5m close (~20k alerts a day across the universe)
-            self.b.event("EMA20_ALERT", book=BOOK, candle=ist(last_t), long=sorted(alerts["long"]),
+            self.b.event("EMA20_ALERT", book="EMA20", candle=ist(last_t), long=sorted(alerts["long"]),
                          short=sorted(alerts["short"]), count=n_alert)
         cut = now - 86400
         self.st["used"] = {k: v for k, v in used.items() if v >= cut}
@@ -268,13 +281,12 @@ class Ema20:
         a = self.st["armed"].pop(key, None)
         if a:
             self.st["used"][key] = a["alert_time"]
-            self.b.event("EMA20_CANCEL", book=BOOK, side=a["side"], symbol=a["symbol"], reason=why,
+            self.b.event("EMA20_CANCEL", book=book_of(a["side"]), side=a["side"], symbol=a["symbol"], reason=why,
                          trigger=a["trigger"], alert=ist(a["alert_time"]))
 
     # ---- live price watch on armed setups ----
     def poll(self, now):
-        d = self.b.data.request("GET", "/fapi/v1/ticker/price")
-        px = {x["symbol"]: float(x.get("price") or 0) for x in d or [] if isinstance(x, dict)}
+        px = self.b.all_prices()
         hits = []
         for key, a in self.st["armed"].items():
             p = px.get(a["symbol"]) or 0
@@ -284,13 +296,13 @@ class Ema20:
             return
         hits.sort(key=lambda h: -(h[0].get("vol24h") or 0))          # highest 24h volume first
         for rank, (a, p) in enumerate(hits, 1):
-            if rank > 1 and not self.has_room():
-                break                   # the book is full now: the rest stay armed (cancelled at the close if traded)
+            if not self.has_room(a["side"]):
+                continue                # that side's book is full: the setup stays armed (cancelled at the close)
             key = f"{a['symbol']}|{a['side']}"
             self.st["armed"].pop(key, None)
             self.st["used"][key] = a["alert_time"]                       # a setup is used once
             sig = {"side": a["side"], "symbol": a["symbol"], "setup": a, "ltp": p, "cand": {"ltp": p}}
-            self.b.event("EMA20_BREACH", book=BOOK, side=a["side"], symbol=a["symbol"], price=p, trigger=a["trigger"],
+            self.b.event("EMA20_BREACH", book=book_of(a["side"]), side=a["side"], symbol=a["symbol"], price=p, trigger=a["trigger"],
                          rank=rank)
             try:
                 self.enter(sig, now)
@@ -302,7 +314,7 @@ class Ema20:
 
     def skip(self, sig, reason, short=None):
         sig["skip_reason"] = short or reason
-        self.b.event("EMA20_SKIP", book=BOOK, side=sig["side"], symbol=sig["symbol"], reason=reason,
+        self.b.event("EMA20_SKIP", book=book_of(sig["side"]), side=sig["side"], symbol=sig["symbol"], reason=reason,
                      trigger=sig["setup"]["trigger"])
 
     def enter(self, sig, now):
@@ -310,6 +322,7 @@ class Ema20:
         side, sym, a = sig["side"], sig["symbol"], sig["setup"]
         p = self.prods().get(sym)
         cand = sig["cand"]
+        BOOK = book_of(side)
         if len(b.book_trades(BOOK)) >= c["max_open"]:
             return self.skip(sig, f"{BOOK} already has {len(b.book_trades(BOOK))} trades open "
                                   f"(MAX_OPEN_TRADES {c['max_open']})", "max open trades")
@@ -410,7 +423,7 @@ class Ema20:
     def check_ema_exits(self, now, bar):
         if self.exit_bar != bar:
             self.exit_bar, self.exit_done = bar, set()
-        for t in list(self.b.book_trades(BOOK)):
+        for t in self.all_trades():
             tid = (t["symbol"], t.get("opened_ts"))
             if tid in self.exit_done or t.get("pending_exit"):
                 continue
@@ -445,7 +458,8 @@ class Ema20:
         try:
             a, c = sig["setup"], sig.get("cand") or {}
             row = {"time": datetime.fromtimestamp(now, IST).strftime("%Y-%m-%d %H:%M:%S"), "bot": "binance-bot",
-                   "book": BOOK, "symbol": sig["symbol"], "side": sig["side"].upper(), "check": "price beyond trigger",
+                   "book": book_of(sig["side"]), "symbol": sig["symbol"], "side": sig["side"].upper(),
+                   "check": "price beyond trigger",
                    "taken": "yes" if sig.get("taken") else "no",
                    "reason": "" if sig.get("taken") else sig.get("skip_reason", ""), "rank": rank,
                    "ltp": c.get("ltp"), "level": a["trigger"],
@@ -477,7 +491,8 @@ class Ema20:
     # ---- reporting ----
     def status_lines(self):
         armed = sorted(self.st["armed"].values(), key=lambda a: -(a.get("vol24h") or 0))
-        return ([f"EMA20 PULLBACK: armed {len(armed)}"
+        n = {sd: sum(1 for a in armed if a["side"] == sd) for sd in ("long", "short")}
+        return ([f"EMA20 LONG / SHORT: armed {n['long']} / {n['short']}"
                  + (f" | last 5m check {hm(self.st['last_bar'] - P5M)}" if self.st["last_bar"] else "")]
                 + [f"  {a['side'].upper()} {a['symbol']} trigger {a['trigger']:g}, pullback stop {a['pb']:g} "
                    f"(1R {a['r_pct']:.2f}%), "

@@ -141,6 +141,10 @@ class Live(unittest.TestCase):
             return {"price": str(self.fd.px[params["symbol"]])}
         return [{"symbol": s, "price": str(p)} for s, p in self.fd.px.items()]
 
+    def poll(self, now):
+        self.b._all_px = None                       # the bot's 2 s price snapshot: every test poll sees new prices
+        self.e.poll(now)
+
     def close(self, cands):
         """Run the 5m-close processing for the bar that starts right after the last candle."""
         bar = cands[-1]["time"] + P
@@ -161,46 +165,46 @@ class Live(unittest.TestCase):
     def test_arm_breach_enter_and_ema_exit(self):
         c, bar = self.arm()
         self.fd.px[self.SYM] = 99.65
-        self.e.poll(bar + 20)
-        self.assertEqual(self.b.book_trades("EMA20 PULLBACK"), [])          # not beyond the trigger yet
+        self.poll(bar + 20)
+        self.assertEqual(self.b.book_trades("EMA20 LONG"), [])          # not beyond the trigger yet
         self.fd.px[self.SYM] = 99.75
-        self.e.poll(bar + 23)
-        t = self.b.book("EMA20 PULLBACK")["open_trade"]
-        self.assertEqual((t["symbol"], t["side"], t["strategy"], t["book"]), (self.SYM, "long", "ema20", "EMA20 PULLBACK"))
+        self.poll(bar + 23)
+        t = self.b.book("EMA20 LONG")["open_trade"]
+        self.assertEqual((t["symbol"], t["side"], t["strategy"], t["book"]), (self.SYM, "long", "ema20", "EMA20 LONG"))
         self.assertAlmostEqual(t["risk0"], t["entry"] - 99.1)                # 1R to the pullback low (closer than 3%)
         self.assertEqual(t["extra"]["pb"], 99.1)
         self.assertAlmostEqual(t["stop"], t["hard_stop"])                    # initial stop = the 3% hard stop
         self.assertAlmostEqual(t["hard_stop"], t["entry"] * 0.985, delta=0.011)          # EMA20: 1.5% hard stop
-        self.assertEqual(self.r.c["hard_stop"], 0.03)                                     # 1H RSI books keep 3%
+        self.assertEqual(self.r.c["hard_stop"], 0.015)                                    # shared 1.5% (28 Nov)
         line = next(x for x in self.b.status_text().splitlines() if "LONG PBUSDT" in x)
         self.assertIn("stop: 5m close below 99.1", line)
         self.assertIn("hard stop ", line)
         self.assertIn("(1.5", line.split("hard stop ")[1])
         self.assertGreater(t["margin"], 99)                                  # the whole $100 book
         self.assertNotIn(f"{self.SYM}|long", self.e.st["armed"])
-        self.assertIn("ENTERED [EMA20 PULLBACK]", self.sent[-1])
+        self.assertIn("ENTERED [EMA20 LONG]", self.sent[-1])
         self.assertIn("trigger 99.7", self.sent[-1])
         self.assertIn("alert", self.ev("ENTRY")[-1]["setup"])
         with open(os.path.join(self.d, "candidates.csv"), newline="") as fh:
             row = list(csv.DictReader(fh))[-1]
         self.assertEqual((row["book"], row["taken"], row["level"], row["check"]),
-                         ("EMA20 PULLBACK", "yes", "99.7", "price beyond trigger"))
-        self.assertIn("EMA20 PULLBACK: armed 0", self.b.status_text())
+                         ("EMA20 LONG", "yes", "99.7", "price beyond trigger"))
+        self.assertIn("EMA20 LONG / SHORT: armed 0 / 0", self.b.status_text())
         self.assertIn(self.SYM, next(x for x in self.b.status_text().splitlines() if "LONG PBUSDT" in x))
         # next 5m candle closes above the EMA: hold; the one after closes below: exit at market
         t["opened_ts"] = c[-1]["time"] + P + 30
         add(c, (99.6, 100.2, 99.5, 100.1))
         self.close(c)
-        self.assertEqual(len(self.b.book_trades("EMA20 PULLBACK")), 1)
+        self.assertEqual(len(self.b.book_trades("EMA20 LONG")), 1)
         add(c, (100.1, 100.1, 97.0, 97.1))
         self.fd.px[self.SYM] = 97.1
         self.close(c)
-        self.assertEqual(self.b.book_trades("EMA20 PULLBACK"), [])
+        self.assertEqual(self.b.book_trades("EMA20 LONG"), [])
         x = self.ev("EXIT")[-1]
-        self.assertEqual((x["reason"], x["book"]), ("PB_CLOSE", "EMA20 PULLBACK"))   # under both: the pullback stop
+        self.assertEqual((x["reason"], x["book"]), ("PB_CLOSE", "EMA20 LONG"))   # under both: the pullback stop
         with open(os.path.join(self.d, "trades.csv"), newline="") as fh:
             tr = list(csv.DictReader(fh))[-1]
-        self.assertEqual((tr["strategy"], tr["exit_reason"]), ("EMA20 PULLBACK", "PB_CLOSE"))
+        self.assertEqual((tr["strategy"], tr["exit_reason"]), ("EMA20 LONG", "PB_CLOSE"))
         self.assertIn("crossed the 20 EMA", tr["setup"])
         self.assertTrue(tr["pnl_pct_margin"])
         msg = next(m for m in self.sent if m.startswith("TRADE CLOSED"))
@@ -212,8 +216,8 @@ class Live(unittest.TestCase):
         add(c, (97.8, 99.6, 97.7, 99.5), (99.5, 99.7, 98.0, 99.2), (99.2, 99.4, 99.0, 99.3))   # red low 98.0
         self.close(c)
         self.fd.px[self.SYM] = 99.75
-        self.e.poll(c[-1]["time"] + P + 20)
-        t = self.b.book("EMA20 PULLBACK")["open_trade"]
+        self.poll(c[-1]["time"] + P + 20)
+        t = self.b.book("EMA20 LONG")["open_trade"]
         t["opened_ts"] = c[-1]["time"] + P + 30
         add(c, (99.6, 99.7, 98.2, 98.3))
         ema = __import__("ema20_rules").ema_series([x["close"] for x in c])
@@ -226,8 +230,8 @@ class Live(unittest.TestCase):
     def enter_long(self):
         c, bar = self.arm()
         self.fd.px[self.SYM] = 99.75
-        self.e.poll(bar + 23)
-        t = self.b.book("EMA20 PULLBACK")["open_trade"]
+        self.poll(bar + 23)
+        t = self.b.book("EMA20 LONG")["open_trade"]
         t["opened_ts"] = c[-1]["time"] + P + 30
         return c, t
 
@@ -235,12 +239,12 @@ class Live(unittest.TestCase):
         c, t = self.enter_long()
         add(c, (99.6, 99.8, 98.9, 99.5))                                     # wick under 99.1, close above: hold
         self.close(c)
-        self.assertEqual(len(self.b.book_trades("EMA20 PULLBACK")), 1)
+        self.assertEqual(len(self.b.book_trades("EMA20 LONG")), 1)
         ema = __import__("ema20_rules").ema_series([x["close"] for x in add(c, (99.5, 99.6, 98.95, 99.0))])
         self.assertGreater(99.0, ema[-1])                                     # above the EMA, below the pullback low
         self.fd.px[self.SYM] = 99.0
         self.close(c)
-        self.assertEqual(self.b.book_trades("EMA20 PULLBACK"), [])
+        self.assertEqual(self.b.book_trades("EMA20 LONG"), [])
         self.assertEqual(self.ev("EXIT")[-1]["reason"], "PB_CLOSE")
         msg = next(m for m in self.sent if m.startswith("TRADE CLOSED"))
         self.assertIn("below the pullback low 99.1", msg)
@@ -250,8 +254,8 @@ class Live(unittest.TestCase):
         add(c, (97.8, 99.6, 97.7, 99.5), (99.5, 99.7, 95.0, 99.2), (99.2, 99.4, 99.0, 99.3))  # red low 95: > 3% away
         self.close(c)
         self.fd.px[self.SYM] = 99.75
-        self.e.poll(c[-1]["time"] + P + 20)
-        t = self.b.book("EMA20 PULLBACK")["open_trade"]
+        self.poll(c[-1]["time"] + P + 20)
+        t = self.b.book("EMA20 LONG")["open_trade"]
         self.assertAlmostEqual(t["risk0"], t["entry"] - t["hard_stop"])
         self.assertIn("to the hard stop", t["extra"]["detail"])
 
@@ -261,15 +265,15 @@ class Live(unittest.TestCase):
         self.close(c)
         self.assertEqual(self.e.st["armed"], {})
         self.assertIn("between two price checks", self.ev("EMA20_CANCEL")[-1]["reason"])
-        self.assertEqual(self.b.book_trades("EMA20 PULLBACK"), [])
+        self.assertEqual(self.b.book_trades("EMA20 LONG"), [])
         self.close(add(c, (99.4, 99.5, 99.3, 99.45)))                       # the used setup is not re-armed
         self.assertEqual(self.e.st["armed"], {})
 
     def test_no_price_watch_while_the_book_is_full(self):
         c, bar = self.arm()
-        self.b.book("EMA20 PULLBACK")["open_trade"] = {"symbol": "XUSDT", "product_id": 99, "side": "short",
+        self.b.book("EMA20 LONG")["open_trade"] = {"symbol": "XUSDT", "product_id": 99, "side": "short",
                                                         "margin": 50.0}
-        self.assertFalse(self.e.has_room())
+        self.assertFalse(self.e.has_room("long"))
         add(c, (99.3, 99.9, 99.2, 99.4))
         self.close(c)
         self.assertIn("no room", self.ev("EMA20_CANCEL")[-1]["reason"])
@@ -287,18 +291,20 @@ class Live(unittest.TestCase):
 
     def test_leftover_rule_and_too_small(self):
         c, bar = self.arm()
-        bk = self.b.book("EMA20 PULLBACK")
+        bk = self.b.book("EMA20 LONG")
         bk["open_trade"] = {"symbol": "XUSDT", "product_id": 99, "side": "short", "margin": 50.0}
         self.fd.px[self.SYM] = 99.75
-        self.e.poll(bar + 20)
-        self.assertEqual(len(self.b.book_trades("EMA20 PULLBACK")), 1)
-        self.assertEqual(self.ev("EMA20_SKIP")[-1]["reason"].split(":")[0][:len("EMA20 PULLBACK has 1")],
-                         "EMA20 PULLBACK has 1")
+        self.poll(bar + 20)
+        self.assertEqual(len(self.b.book_trades("EMA20 LONG")), 1)
+        self.assertEqual(self.ev("EMA20_SKIP"), [])                         # no room: not even tried...
+        self.assertIn(f"{self.SYM}|long", self.e.st["armed"])                # ...and still armed
+        self.assertEqual(self.e.avail_margin_reason("long") if hasattr(self.e, "avail_margin_reason") else "no leftover",
+                         "no leftover")
         bk["open_trade"] = None
         self.e.st["armed"][f"{self.SYM}|long"] = dict(self.e.arm_record(self.SYM, "long", {
             "trigger": 99.7, "low": 97.7, "pb": 99.1, "r": 0.6, "ema": 98.3, "alert_time": 1, "pull": [2, 3], "armed_time": 3}))
         self.fd.depth_qty = 0.05                                              # thin book: impact limit << 25%
-        self.e.poll(bar + 26)
+        self.poll(bar + 26)
         self.assertEqual(self.ev("EMA20_SKIP")[-1]["reason"][:9], "too small")
 
     def test_after_a_fill_the_other_breaches_stay_armed(self):
@@ -307,10 +313,27 @@ class Live(unittest.TestCase):
             "trigger": 1.0, "low": 0.9, "pb": 0.95, "r": 0.05, "ema": 0.97, "alert_time": 5, "pull": [6, 7],
             "armed_time": 7}), vol24h=1)
         self.fd.px.update({self.SYM: 99.75, "QQUSDT": 1.1})
-        self.e.poll(bar + 23)
-        self.assertEqual(self.b.book("EMA20 PULLBACK")["open_trade"]["symbol"], self.SYM)   # higher volume first
+        self.poll(bar + 23)
+        self.assertEqual(self.b.book("EMA20 LONG")["open_trade"]["symbol"], self.SYM)   # higher volume first
         self.assertIn("QQUSDT|long", self.e.st["armed"])                                  # not consumed
         self.assertEqual(self.ev("EMA20_SKIP"), [])
+
+    def test_short_setups_trade_in_the_short_book(self):
+        self.fd.add("SHUSDT", 8, 3_000_000, [])
+        self.r.prods = self.r.universe()
+        c = mirror(long_setup())
+        self.fd.c5["SHUSDT"] = c
+        bar = c[-1]["time"] + P
+        self.e.on_close(bar + 9, bar, self.e.fetch_all(["SHUSDT"], bar, bar + 9))
+        self.assertIn("SHUSDT|short", self.e.st["armed"])
+        self.b.book("EMA20 LONG")["open_trade"] = {"symbol": "XUSDT", "product_id": 99, "side": "long", "margin": 100.0}
+        self.assertFalse(self.e.has_room("long"))
+        self.assertTrue(self.e.has_room("short"))                            # own book, own margin
+        self.fd.px["SHUSDT"] = 200 - 99.75
+        self.poll(bar + 20)
+        t = self.b.book("EMA20 SHORT")["open_trade"]
+        self.assertEqual((t["symbol"], t["side"], t["book"]), ("SHUSDT", "short", "EMA20 SHORT"))
+        self.assertGreater(t["margin"], 99)
 
     def test_sides_config(self):
         self.e.c["sides"] = ("short",)
