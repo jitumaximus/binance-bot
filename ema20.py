@@ -11,6 +11,10 @@ CANDLES   after each 5m close (+EMA20_CHECK_DELAY_SEC, 8 s): 5m klines (99, requ
           first (their exit check runs at once), then armed setups, then the rest. Each symbol's candles are reduced
           to the setup state at the last closed candle in the worker; nothing big is kept.
 SETUP     alert -> 2 pullback candles -> armed with a trigger (EMA20_ALERT, EMA20_ARMED, EMA20_CANCEL events).
+          Alert candle (28 Nov 2026): green crossing up / red crossing down AND strong: body >= EMA20_MIN_BODY_SHARE
+          (60%) of its range, >= EMA20_MIN_BODY_X (1.5) x the average body of the previous EMA20_BODY_AVG_N (20)
+          closed candles, and it OPENS across the 20 EMA (EMA20_OPEN_ACROSS=1). Its numbers are in EMA20_ARMED
+          (body_share, body_x, alert_open, ema) and in the trade's setup text.
           Sides: EMA20_SIDES = both | long | short. Armed setups are watched on the live price: one call for all
           symbols (/fapi/v1/ticker/price, weight 2) every EMA20_POLL_SEC (3 s) while something is armed, also while
           the book is full or the bot is paused (28 Nov 2026: then the trigger trading cancels the setup, "level
@@ -80,8 +84,23 @@ def load_cfg(env=None):
              check_delay=f("EMA20_CHECK_DELAY_SEC", 8), poll_sec=f("EMA20_POLL_SEC", 3),
              fetch_workers=int(f("EMA20_FETCH_WORKERS", 4)), be_r=f("EMA20_BE_R", 1),
              trail_start_r=f("EMA20_TRAIL_START_R", 3),
+             # strong alert candle (28 Nov 2026), see ema20_rules.STRONG
+             strong={"min_body_share": f("EMA20_MIN_BODY_SHARE", 0.60), "min_body_x": f("EMA20_MIN_BODY_X", 1.5),
+                     "avg_n": int(f("EMA20_BODY_AVG_N", 20)),
+                     "open_across": str(e.get("EMA20_OPEN_ACROSS", "1")).strip().lower() in ("1", "true", "yes", "on")},
              hard_stop=f("EMA20_HARD_STOP_PCT", c["hard_stop"]))   # default: the shared HARD_STOP_PCT (1.5%)
     return c
+
+
+def alert_text(a):
+    """'green alert 10:40: body 72% of range, 1.9x the 20-candle average, opened below the 20 EMA (0.0661) and
+    closed above' (older armed records without the numbers: the short form)."""
+    long_ = a["side"] == "long"
+    head = f"{'green' if long_ else 'red'} alert {datetime.fromtimestamp(a['alert_time'], IST).strftime('%H:%M')}"
+    if a.get("body_share") is None:
+        return f"{head} crossed the 20 EMA ({a['ema']:.6g})"
+    return (f"{head}: body {a['body_share'] * 100:.0f}% of range, {a['body_x']:.1f}x the 20-candle average, opened "
+            f"{'below' if long_ else 'above'} the 20 EMA ({a['ema']:.6g}) and closed {'above' if long_ else 'below'}")
 
 
 def hm(ts):
@@ -210,7 +229,7 @@ class Ema20:
                 n = len(cand) - 1
                 out = {}
                 for side in c["sides"]:
-                    sets = E.scan_setups(cand, side, c["max_wait"], c["min_r_pct"])
+                    sets = E.scan_setups(cand, side, c["max_wait"], c["min_r_pct"], strong=c.get("strong"))
                     out[side] = [s for s in sets if s.get("end_i", n) >= n - 1 or s["status"] in ("pullback", "armed")]
                     for s in out[side]:
                         s["last_i"] = n
@@ -250,6 +269,8 @@ class Ema20:
                         a = armed[key]
                         self.b.event("EMA20_ARMED", book=book_of(side), side=side, symbol=sym, trigger=a["trigger"],
                                      pullback_stop=a["pb"], low=a["low"], r=a["r"], r_pct=a["r_pct"], ema=a["ema"], alert=ist(a["alert_time"]),
+                                     alert_open=a.get("alert_open"), alert_close=a.get("alert_close"),
+                                     body_share=a.get("body_share"), body_x=a.get("body_x"), alert_text=alert_text(a),
                                      pullback=[ist(x) for x in a["pull"]], expires=ist(a["expires"]))
                     if cur and s["alert_time"] == cur["alert_time"]:
                         seen.add(key)
@@ -286,6 +307,9 @@ class Ema20:
         return {"symbol": sym, "side": side, "trigger": s["trigger"], "low": s["low"], "pb": s["pb"], "r": s["r"],
                 "r_pct": round(s["r"] / s["trigger"] * 100, 3), "ema": round(s["ema"], 10),
                 "alert_time": s["alert_time"], "pull": s["pull"][:2], "armed_time": s["armed_time"],
+                "alert_open": s.get("alert_open"), "alert_close": s.get("alert_close"),
+                "body_share": round(s["body_share"], 3) if s.get("body_share") is not None else None,
+                "body_x": round(s["body_x"], 2) if s.get("body_x") is not None else None,
                 "expires": s["armed_time"] + self.c["max_wait"] * P5M,
                 "vol24h": (self.prods().get(sym) or {}).get("vol24h")}
 
@@ -418,8 +442,7 @@ class Ema20:
                     loss_pct_if_stopped=round(loss_pct, 2), r_pct=round(r / entry * 100, 3), stop_candle=pb)
         info.update(notional=qty * entry, risk_usd=qty * abs(entry - hard), margin=qty * entry / lev)
         x = tx["exec"]
-        detail = (f"{'green' if side == 'long' else 'red'} alert {hm(a['alert_time'])} crossed the 20 EMA "
-                  f"({a['ema']:.6g}); pullback {', '.join(hm(t) for t in a['pull'])}; trigger {a['trigger']:g} "
+        detail = (f"{alert_text(a)}; pullback {', '.join(hm(t) for t in a['pull'])}; trigger {a['trigger']:g} "
                   f"(armed {hm(a['armed_time'] + P5M)}, expires {hm(a['expires'] + P5M)}) | stop: a 5m close "
                   f"{'below' if side == 'long' else 'above'} the pullback {'low' if side == 'long' else 'high'} {pb:g} "
                   f"({abs(entry - pb) / entry * 100:.2f}%) or the hard stop {hard:g} ({c['hard_stop'] * 100:g}%) | 1R "

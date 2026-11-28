@@ -2,7 +2,9 @@
 
 LONG (SHORT is the exact mirror):
  1. Alert candle: green, crosses the 20 EMA from below (its open, or the previous close, below the EMA) and closes
-    above the EMA.
+    above the EMA. Since 28 Nov 2026 it must also be strong (STRONG, EMA20_* env in ema20.py): body >= 60% of its
+    high-low range, body >= 1.5x the average body of the previous 20 closed candles, and it OPENS below the EMA
+    (open_across: the previous close no longer counts).
  2. Pullback: of the next 2 candles at least one is red and neither closes below the 20 EMA. Trigger = the red
     candle's high (the higher high if both are red).
  3. From the 3rd candle on, armed: enter as soon as price trades above the trigger. Cancelled if a 5m candle closes
@@ -33,13 +35,40 @@ def _red(c):
     return c["close"] < c["open"]
 
 
-def is_alert(cands, ema, i, side):
-    """Candle i crosses the EMA in the trade's direction and closes beyond it."""
+# strong alert candle (28 Nov 2026): body share of the range, body vs the average of the previous avg_n bodies, open
+# on the other side of the EMA
+STRONG = {"min_body_share": 0.60, "min_body_x": 1.5, "avg_n": 20, "open_across": True}
+
+
+def alert_stats(cands, ema, i, side, strong=None):
+    """The alert candle's numbers: body share of its range, body vs the average body of the previous avg_n closed
+    candles (not counting candle i) and the EMA at it. None when the range or the average is 0 / not enough candles."""
+    st = dict(STRONG, **(strong or {}))
+    c = cands[i]
+    rng, body, n = c["high"] - c["low"], abs(c["close"] - c["open"]), int(st["avg_n"])
+    if rng <= 0 or i < n:
+        return None
+    avg = sum(abs(x["close"] - x["open"]) for x in cands[i - n:i]) / n
+    return {"body_share": body / rng, "body_x": min(body / avg, 999.0) if avg > 0 else 999.0, "avg_body": avg,
+            "alert_open": c["open"], "alert_close": c["close"], "ema": ema[i]}
+
+
+def is_alert(cands, ema, i, side, strong=None):
+    """Candle i crosses the EMA in the trade's direction and closes beyond it, and is a strong candle (STRONG).
+    Returns its alert_stats (truthy) or None."""
+    st = dict(STRONG, **(strong or {}))
     c, e = cands[i], ema[i]
     prev_beyond = i > 0 and ((cands[i - 1]["close"] < ema[i - 1]) if side == "long" else (cands[i - 1]["close"] > ema[i - 1]))
     if side == "long":
-        return _green(c) and c["close"] > e and (c["open"] < e or prev_beyond)
-    return _red(c) and c["close"] < e and (c["open"] > e or prev_beyond)
+        cross = _green(c) and c["close"] > e and (c["open"] < e or (prev_beyond and not st["open_across"]))
+    else:
+        cross = _red(c) and c["close"] < e and (c["open"] > e or (prev_beyond and not st["open_across"]))
+    if not cross:
+        return None
+    a = alert_stats(cands, ema, i, side, st)
+    if a is None or a["body_share"] < st["min_body_share"] - 1e-12 or a["body_x"] < st["min_body_x"] - 1e-12:
+        return None
+    return a
 
 
 def closes_against(c, e, side):
@@ -47,7 +76,7 @@ def closes_against(c, e, side):
     return c["close"] < e if side == "long" else c["close"] > e
 
 
-def scan_setups(cands, side, max_wait=12, min_r_pct=0.002, n=EMA_LEN, warm=WARM):
+def scan_setups(cands, side, max_wait=12, min_r_pct=0.002, n=EMA_LEN, warm=WARM, strong=None):
     """Walk ascending CLOSED 5m candles and return every setup, oldest first. Each setup:
       alert_i, alert_time, pull (2 candle times), status, trigger, low (lowest low / highest high of the alert and
       pullback candles), pb (the pullback stop level), r (trigger - pb, at least min_r_pct), ema (at the alert), armed_i / armed_time (close of the 2nd pullback
@@ -99,9 +128,11 @@ def scan_setups(cands, side, max_wait=12, min_r_pct=0.002, n=EMA_LEN, warm=WARM)
             cur = None
             # the candle that ended a setup may itself be a new alert (e.g. a cancel close is never an alert, but a
             # failed pullback or an expiry candle can be)
-        if is_alert(cands, ema, i, side):
+        a = is_alert(cands, ema, i, side, strong)
+        if a:
             cur = {"side": side, "alert_i": i, "alert_time": c["time"], "pull": [], "status": "pullback",
-                   "ema": e, "alert_open": c["open"], "alert_close": c["close"]}
+                   "ema": e, "alert_open": c["open"], "alert_close": c["close"],
+                   "body_share": a["body_share"], "body_x": a["body_x"], "avg_body": a["avg_body"]}
             out.append(cur)
     return out
 

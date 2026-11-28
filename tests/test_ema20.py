@@ -101,7 +101,7 @@ class Rules(unittest.TestCase):
 
     def test_min_r(self):
         c = base()
-        add(c, (98.25, 98.6, 98.24, 98.5), (98.5, 98.55, 98.45, 98.48), (98.48, 98.52, 98.46, 98.5))
+        add(c, (98.0, 98.6, 97.99, 98.5), (98.5, 98.55, 98.45, 98.48), (98.48, 98.52, 98.46, 98.5))   # opens below the EMA (28 Nov)
         s = E.scan_setups(c, "long", min_r_pct=0.01)[-1]
         if s["status"] == "armed":
             self.assertAlmostEqual(s["r"], s["trigger"] * 0.01)
@@ -118,6 +118,55 @@ class Rules(unittest.TestCase):
 
     def test_warmup(self):
         self.assertEqual(E.scan_setups(long_setup()[:30], "long"), [])
+
+
+class StrongAlert(unittest.TestCase):
+    """28 Nov 2026: the alert candle must be strong: body >= 60% of its range, >= 1.5x the average body of the 20
+    candles before it, opened on the other side of the 20 EMA (EMA fixed at 100 here; 20 prior bodies of 1.0)."""
+    EMA = 100.0
+
+    def series(self, alert, prev_close=99.5):
+        out = []
+        for k in range(20):                                    # bodies of 1.0, all closing below the EMA
+            o, c = (98.5, prev_close) if k % 2 == 0 else (prev_close, 98.5)
+            out.append({"time": T0 + k * P, "open": o, "high": max(o, c) + 0.1, "low": min(o, c) - 0.1, "close": c, "volume": 1})
+        o, h, lo, c = alert
+        out.append({"time": T0 + 20 * P, "open": o, "high": h, "low": lo, "close": c, "volume": 1})
+        return out, [self.EMA] * len(out)
+
+    def alert(self, ohlc, side="long"):
+        c, e = self.series(ohlc)
+        if side == "short":
+            c = mirror(c)
+            e = [200 - x for x in e]
+        return E.is_alert(c, e, len(c) - 1, side)
+
+    def test_doji_crossing_the_ema_is_no_alert(self):
+        self.assertIsNone(self.alert((99.95, 101.0, 99.0, 100.05)))            # body 0.1 = 5% of the range
+
+    def test_half_body_is_no_alert(self):
+        self.assertIsNone(self.alert((99.0, 102.0, 98.0, 101.0)))              # body 2 = 50% of the range, 2x
+
+    def test_body_only_1_2x_the_average_is_no_alert(self):
+        self.assertIsNone(self.alert((99.4, 100.7, 99.3, 100.6)))              # 86% of the range but 1.2x
+
+    def test_opened_above_the_ema_is_no_long_alert(self):
+        # strong green candle, previous close below the EMA (counted before 28 Nov), but it opened above it
+        self.assertIsNone(self.alert((100.2, 102.4, 100.1, 102.2)))
+        self.assertTrue(E.is_alert(*self.series((100.2, 102.4, 100.1, 102.2)), 20, "long", {"open_across": False}))
+
+    def test_strong_candle_is_an_alert_both_sides(self):
+        for side in ("long", "short"):
+            a = self.alert((99.0, 101.4, 98.55, 101.0), side)                  # 70% of the range, 2x, open < EMA < close
+            self.assertIsNotNone(a, side)
+            self.assertAlmostEqual(a["body_share"], 2 / 2.85)
+            self.assertAlmostEqual(a["body_x"], 2.0)
+
+    def test_text(self):
+        import ema20
+        a = {"side": "long", "alert_time": T0, "ema": 0.0661, "body_share": 0.72, "body_x": 1.9}
+        self.assertIn("body 72% of range, 1.9x the 20-candle average, opened below the 20 EMA (0.0661) and closed above",
+                      ema20.alert_text(a))
 
 
 class Live(unittest.TestCase):
@@ -205,7 +254,8 @@ class Live(unittest.TestCase):
         with open(os.path.join(self.d, "trades.csv"), newline="") as fh:
             tr = list(csv.DictReader(fh))[-1]
         self.assertEqual((tr["strategy"], tr["exit_reason"]), ("EMA20 LONG", "PB_CLOSE"))
-        self.assertIn("crossed the 20 EMA", tr["setup"])
+        self.assertIn("opened below the 20 EMA (98.3412) and closed above", tr["setup"])    # 28 Nov: strong alert
+        self.assertIn("body 90% of range, 34.0x the 20-candle average", tr["setup"])
         self.assertTrue(tr["pnl_pct_margin"])
         msg = next(m for m in self.sent if m.startswith("TRADE CLOSED"))
         self.assertIn("Exit: 5m", msg)
