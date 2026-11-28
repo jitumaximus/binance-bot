@@ -1,7 +1,7 @@
 """No late entries (28 Nov 2026), every book and side, through the bot with the fake Binance client:
 - the level trades while the book is full -> no entry (the setup is cancelled / the signal skipped);
 - price 0.05% past the level -> entry; price 0.5% past the level -> cancelled / skipped;
-- 1H RSI: latest closed 1H RSI 5 (long) / 95 (short) -> skipped; entry 1.2% from the divergence low / high -> skipped.
+- 1H RSI: latest closed 1H RSI 5 (long) / 95 (short) -> skipped; candle stop more than 2% away -> skipped.
 Every cancel / skip is a candidates.csv row with taken=no, the reason, the level, the LTP and the distance %."""
 import csv
 import os
@@ -234,7 +234,6 @@ class Rsi1h(TR.Runner):
             self.assertEqual(self.b.book_trades(book)[0]["symbol"], "AUSDT", side)
 
     def test_candle_stop_wider_than_2pct_skips(self):
-        self.r.c["max_from_extreme"] = 0.05             # let the 1% rule pass, to reach the 2% stop rule
         book, sig = self.go("long", 0.0, far=2.5)
         self.assertEqual(self.b.book_trades(book), [])
         self.assertIn("(> 2%)", self.ev("RSI1H_SKIP")[-1]["reason"])
@@ -253,17 +252,12 @@ class Rsi1h(TR.Runner):
         book, sig = self.go("long", 0.0, rsi=10.5)                 # inside the limit: trades
         self.assertEqual(len(self.b.book_trades(book)), 1)
 
-    def test_too_far_from_the_divergence_low_high(self):
-        book, sig = self.go("long", 0.0, far=1.2)
-        self.assertEqual(self.b.book_trades(book), [])
-        self.skipped(book, sig, "entry too far from the divergence low")
-        self.setUp()
-        book, sig = self.go("short", 0.0, far=1.2)
-        self.assertEqual(self.b.book_trades(book), [])
-        self.skipped(book, sig, "entry too far from the divergence high")
-        self.setUp()
-        book, sig = self.go("long", 0.0, far=0.8)                  # within 1%: trades
-        self.assertEqual(len(self.b.book_trades(book)), 1)
+    def test_far_from_the_low_high_but_stop_within_2pct_enters(self):
+        """The 1%-from-the-low/high rule was dropped (28 Nov 2026): 1.2% away trades, the stop is within 2%."""
+        for side in ("long", "short"):
+            self.setUp()
+            book, sig = self.go(side, 0.0, far=1.2)
+            self.assertEqual(len(self.b.book_trades(book)), 1, side)
 
 
 # run only the tests above, not the ones inherited from the fixtures' classes

@@ -24,8 +24,7 @@ ENTRY     market at the start of the next candle (the check ~8 s after the close
           the cap: RSI1H_SKIP "price past the cap: no late entry" (28 Nov 2026). Armed coins are checked even while the book
           is full or the bot is paused: such a signal is skipped ("level traded while the book was full: no late
           entry") and never entered later. Also skipped (28 Nov 2026): latest closed 1H RSI < RSI1H_EXTREME_LONG (10)
-          for a long ("falling knife") / > RSI1H_EXTREME_SHORT (90) for a short ("runaway pump"); entry more than
-          RSI1H_MAX_FROM_EXTREME_PCT (1%) above the divergence candle's low (long) / below its high (short). Every
+          for a long ("falling knife") / > RSI1H_EXTREME_SHORT (90) for a short ("runaway pump"). Every
           skip is a candidates.csv row (taken=no, reason, level, LTP, distance %). Paper fill = last trade price, RSI1H_SLIPPAGE_PCT against us (0 = like the POC paper fills),
           taker fee FEE_PCT_PER_SIDE on both sides (in bot.close_trade). Several coins at once: highest 24h quote
           volume first (RSI1H_RANK_BY=volume, default since 25 Nov 2026; =rsi: most extreme 1H RSI first); if one is
@@ -129,10 +128,10 @@ def load_cfg(env=None):
         # no late entries (28 Nov 2026): every book enters only within this fraction of its level (1H RSI: the
         # divergence candle's close, EMA20: the trigger; 4H RETRACE has RETRACE_ENTRY_CAP_PCT)
         "level_cap": f("ENTRY_LEVEL_CAP_PCT", 0.001),
-        # 1H RSI skip rules (28 Nov 2026): latest closed 1H RSI too extreme; entry too far from the divergence low/high
+        # 1H RSI skip rule (28 Nov 2026): latest closed 1H RSI too extreme (the 1%-from-the-low/high rule was dropped
+        # the same day: the 2% candle-stop limit, RSI1H_MAX_STOP_PCT, covers it)
         "extreme_long": f("RSI1H_EXTREME_LONG", 10),
         "extreme_short": f("RSI1H_EXTREME_SHORT", 90),
-        "max_from_extreme": f("RSI1H_MAX_FROM_EXTREME_PCT", 1) / 100.0,
     }
 
 
@@ -780,13 +779,6 @@ class Rsi1h:
         entry, tick, lev = lv[0][0], p["tick"], c["leverage"]
         if band and (entry > band[1] if side == "long" else entry < band[0]):
             return self.skip(sig, book, late_cap(entry, level, band) + " [order book]", "past the cap")
-        ext = sig["stop_ref"]                       # the divergence candle's low (long) / high (short)
-        far = (entry / ext - 1) if side == "long" else (1 - entry / ext)
-        if ext > 0 and far > c["max_from_extreme"] + 1e-12:
-            return self.skip(sig, book, f"entry too far from the divergence {'low' if side == 'long' else 'high'}: "
-                                        f"{entry:g} is {far * 100:.2f}% {'above' if side == 'long' else 'below'} {ext:g} "
-                                        f"(max {c['max_from_extreme'] * 100:g}%)",
-                             "too far from the divergence " + ("low" if side == "long" else "high"))
         buf = b.cfg.get("stop_buffer_ticks", 1)
         stop, candle_stop, widened = stop_for(side, sig["stop_ref"], entry, tick, buf, c["min_stop_pct"])
         cand.update(stop_candle=candle_stop, stop_used=stop, stop_pct=abs(entry - stop) / entry * 100)
