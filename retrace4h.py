@@ -9,10 +9,14 @@ SETUP     each coin's own closed 4h candles (Binance 4h, UTC-aligned; checked RE
           candles, and |body| >= RETRACE_BODY_SHARE (80%) of the candle's high-low range. Green -> 4H RETRACE LONG,
           red -> 4H RETRACE SHORT. mid = (high + low) / 2, wicks included. Events 4H_SETUP and 4H_ARMED.
 ENTRY     within RETRACE_WINDOW_H (24 h) after that candle closes: when the last trade price comes back to the mid
-          (long: at/below it; short: at/above it; watched every RETRACE_POLL_SEC, 3 s, while something is armed and
-          that side's book has room), capped IOC limit entry through the bot's executor: the size is limited by the
+          (long: at/below it; short: at/above it; watched every RETRACE_POLL_SEC, 3 s, while something is armed, also
+          while the book is full or the bot is paused), capped IOC limit entry through the bot's executor, ONLY while
+          the price is within RETRACE_ENTRY_CAP_PCT (0.1%) of the mid on either side: mid x 0.999 <= price <= mid x
+          1.001 (28 Nov 2026; before, a long could fill any distance below the mid). Beyond that, or the mid trading
+          while the book is full: 4H_CANCEL "price past the cap / level traded while the book was full: no late
+          entry", and a candidates.csv row (taken=no, reason, level, LTP, distance %). The size is limited by the
           order book (largest size whose average fill stays within MAX_IMPACT_PCT, 0.05%, of the best price), the IOC
-          children never go beyond RETRACE_ENTRY_CAP_PCT (0.1%) past the mid. One entry per setup candle; a setup
+          children never go beyond the band's far edge. One entry per setup candle; a setup
           that could not be entered (no fill within the cap, book full, too small, ...) is retried at most every 60 s
           until it expires (4H_CANCEL "expired"). After a restart, a setup whose mid already traded while it was not
           watched is cancelled (no late entry).
@@ -164,9 +168,9 @@ class Retrace4h:
             except Exception:  # noqa: BLE001
                 log.exception("4H RETRACE scan failed")
         self.expire(now)
-        if (self.ready and self.st["armed"] and now - self.last_poll >= self.c["poll_sec"]
-                and not self.b.state.get("paused")
-                and any(self.has_room(sd) for sd in {a["side"] for a in self.st["armed"].values()})):
+        # every armed setup is watched, also while its book is full or the bot is paused (28 Nov 2026): the mid
+        # trading then cancels the setup (no late entry)
+        if self.ready and self.st["armed"] and now - self.last_poll >= self.c["poll_sec"]:
             self.last_poll = now
             try:
                 self.poll(now)
@@ -232,9 +236,11 @@ class Retrace4h:
                     continue                    # only the 4h candle that just closed arms (no late pick-up after a restart)
                 if s["touched_at"] is not None:
                     used[key] = s["candle"]
+                    why = f"mid traded at {ist(s['touched_at'])} before it was watched: no late entry"
                     self.b.event("4H_CANCEL", book=book_of(s["side"]), side=s["side"], symbol=sym,
-                                 candle=ist(s["candle"]), mid=s["mid"],
-                                 reason=f"mid traded at {ist(s['touched_at'])} before it was watched: no late entry")
+                                 candle=ist(s["candle"]), mid=s["mid"], reason=why)
+                    self.candidate({"side": s["side"], "symbol": sym, "cand": {}, "skip_reason": why,
+                                    "setup": dict(s, vol24h=None)}, "", now, check="cancel")
                     n_cancel += 1
                     continue
                 a = {"symbol": sym, "side": s["side"], "candle": s["candle"], "mid": s["mid"], "open": s["open"],
@@ -253,12 +259,18 @@ class Retrace4h:
         log.info("4H RETRACE %s close: %d symbols (%d errors) | setups %d, armed %d new / %d now, cancelled %d",
                  hm(bar - P4H), job["n"], job["errors"], n_setup, n_armed, len(armed), n_cancel)
 
-    def cancel(self, key, why):
+    def cancel(self, key, why, ltp=None, now=None, sig=None):
+        """Drop an armed setup: 4H_CANCEL event and a candidates.csv row (taken=no, level, LTP, distance)."""
         a = self.st["armed"].pop(key, None)
         if a:
             self.st["used"][key] = a["candle"]
             self.b.event("4H_CANCEL", book=book_of(a["side"]), side=a["side"], symbol=a["symbol"],
-                         candle=ist(a["candle"]), mid=a["mid"], reason=why)
+                         candle=ist(a["candle"]), mid=a["mid"], reason=why,
+                         **({"price": ltp, "distance_pct": round(R.dist_pct(ltp, a["mid"]), 4)} if ltp else {}))
+            if sig is None:
+                sig = {"side": a["side"], "symbol": a["symbol"], "setup": a, "cand": {"ltp": ltp}}
+            sig["skip_reason"] = why
+            self.candidate(sig, "", now or time.time(), check="cancel")
 
     def expire(self, now):
         gone = [k for k, a in self.st["armed"].items() if now >= a["expires"]]
@@ -279,7 +291,15 @@ class Retrace4h:
             return
         hits.sort(key=lambda h: -(h[1].get("vol24h") or 0))          # highest 24h volume first
         for rank, (key, a, p) in enumerate(hits, 1):
+            band = R.entry_band(a["side"], a["mid"], self.c["entry_cap_pct"], both=True)
+            if self.b.state.get("paused"):
+                self.cancel(key, R.LATE_PAUSED, p, now)
+                continue
             if not self.has_room(a["side"]):
+                self.cancel(key, R.LATE_FULL, p, now)       # the book is full: never entered later
+                continue
+            if not R.in_band(p, band):
+                self.cancel(key, R.late_cap(p, a["mid"], band), p, now)
                 continue
             sig = {"side": a["side"], "symbol": a["symbol"], "setup": a, "ltp": p, "cand": {"ltp": p}}
             try:
@@ -287,6 +307,9 @@ class Retrace4h:
             except Exception:  # noqa: BLE001
                 log.exception("4H RETRACE entry failed")
                 sig["skip_reason"] = "error"
+            if sig.get("late"):
+                self.cancel(key, sig["late"], p, now, sig=sig)
+                continue
             if sig.get("taken"):
                 self.st["armed"].pop(key, None)
                 self.st["used"][key] = a["candle"]                       # one entry per setup candle
@@ -325,10 +348,13 @@ class Retrace4h:
         if not lv:
             return self.skip(sig, "empty order book", "no order book")
         tick, lev = p["tick"], c["leverage"]
-        cap = R.round_tick(a["mid"] * (1 + c["entry_cap_pct"]) if side == "long" else a["mid"] * (1 - c["entry_cap_pct"]),
-                           tick, "down" if side == "long" else "up")
+        band = R.entry_band(side, a["mid"], c["entry_cap_pct"], both=True)    # mid x (1 -/+ 0.1%)
+        cap = R.band_cap(side, band, tick)
         entry = lv[0][0]
         cand.update(level=a["mid"], entry_cap=cap)
+        if (side == "long" and entry < band[0]) or (side == "short" and entry > band[1]):
+            sig["late"] = R.late_cap(entry, a["mid"], band) + " [order book]"   # beyond the mid: cancelled
+            return self.skip(sig, sig["late"], "past the cap")
         if (side == "long" and entry > cap) or (side == "short" and entry < cap):
             return self.skip(sig, f"best {'ask' if side == 'long' else 'bid'} {entry:g} is beyond the cap {cap:g} "
                                   f"({c['entry_cap_pct'] * 100:g}% past the mid {a['mid']:g})", "beyond cap")
@@ -399,12 +425,12 @@ class Retrace4h:
         t["risk0"] = r                     # 1R = 1.5% of the entry (the stop rounds to the tick)
         b.save_state()
 
-    def candidate(self, sig, rank, now):
+    def candidate(self, sig, rank, now, check="price back at the 4h mid"):
         try:
             a, c = sig["setup"], sig.get("cand") or {}
             row = {"time": datetime.fromtimestamp(now, IST).strftime("%Y-%m-%d %H:%M:%S"), "bot": "binance-bot",
                    "book": book_of(sig["side"]), "symbol": sig["symbol"], "side": sig["side"].upper(),
-                   "check": "price back at the 4h mid", "taken": "yes" if sig.get("taken") else "no",
+                   "check": check, "taken": "yes" if sig.get("taken") else "no",
                    "reason": "" if sig.get("taken") else sig.get("skip_reason", ""), "rank": rank,
                    "ltp": c.get("ltp"), "level": a["mid"], "range_low": a["low"], "range_high": a["high"],
                    "candle_open": a["open"], "candle_colour": "green" if a["side"] == "long" else "red",
@@ -412,7 +438,7 @@ class Retrace4h:
                    "ref_time": ist(a["candle"]), "stop_used": c.get("stop_used"),
                    "stop_pct": round(c["stop_pct"], 3) if c.get("stop_pct") is not None else None,
                    "size": c.get("size"), "vol24h_usdt": round(a["vol24h"]) if a.get("vol24h") else None,
-                   "rank_by": "volume", "r_pct": c.get("r_pct")}
+                   "rank_by": "volume" if rank != "" else "", "r_pct": c.get("r_pct")}
             x = c.get("exec") or {}
             row.update({k: x.get(k) for k in ("depth5_qty", "liq_cap_qty", "liq_capped", "entry_ref", "entry_cap",
                                               "entry_avg", "entry_slip_pct", "entry_children", "qty_intended",

@@ -157,7 +157,7 @@ class Live(unittest.TestCase):
         self.x.st["armed"]["RTUSDT|long|1"] = {"symbol": self.SYM, "side": "long", "candle": 1, "mid": 101.5,
                                                "expires": BAR0 + 9 * P4, "next_try": 0, "vol24h": 1, "open": 100.0, "high": 103.1,
                                                "low": 99.9, "close": 103.0, "body_x": 3.0, "body_share": 0.94}
-        self.fd.px[self.SYM] = 101.0
+        self.fd.px[self.SYM] = 101.45                        # within 0.1% of the mid 101.5
         self.x.st["last_bar"] = BAR0 + 3 * P4               # no new 4h close: no scan, so not ready
         self.x.tick(BAR0 + 3 * P4 + 20)
         self.assertFalse(self.x.ready)

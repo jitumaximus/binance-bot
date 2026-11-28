@@ -327,7 +327,7 @@ class Runner(unittest.TestCase):
         cands, sig = find_signal("short", 300, 45, end)
         self.arm("short", [("AUSDT", 75.0), ("BUSDT", 88.0)])
         self.fd.c5 = {"AUSDT": cands, "BUSDT": cands}
-        px = round(sig["div_open"] * 0.999, 4)
+        px = sig["div_close"]
         self.fd.px = {"AUSDT": px, "BUSDT": px}
         self.r.tick(end + 5)                                                 # before the 8 s delay: nothing
         self.assertEqual(self.ev("RSI1H_SIGNAL"), [])
@@ -389,7 +389,7 @@ class Runner(unittest.TestCase):
         end2 = end + 900
         cands2, sig2 = find_signal("short", 300, 45, end2)
         self.fd.c5 = {"BUSDT": cands2}
-        self.fd.px = {"BUSDT": round(sig2["div_open"] * 0.999, 4)}
+        self.fd.px = {"BUSDT": sig2["div_close"]}
         self.r.st["armed_short"] = {"BUSDT": {"rsi": 80.0, "candle": T0}}
         self.r.tick(end2 + 8)
         self.assertIn("cooldown", self.ev("RSI1H_SKIP")[-1]["reason"])
@@ -402,7 +402,7 @@ class Runner(unittest.TestCase):
         self.fd.c5 = {"AUSDT": cands}
         self.fd.px = {"AUSDT": sig["div_open"]}
         self.r.tick(end + 8)
-        self.assertIn("not below the red divergence candle's open", self.ev("RSI1H_SKIP")[-1]["reason"])
+        self.assertIn("not at the divergence candle's close yet", self.ev("RSI1H_SKIP")[-1]["reason"])   # 28 Nov: band
         self.assertIsNone(self.b.book("1H RSI SHORT")["open_trade"])
 
     def test_long_on_15m(self):
@@ -410,7 +410,7 @@ class Runner(unittest.TestCase):
         cands, sig = find_signal("long", 900, 120, end)
         self.arm("long", [("LUSDT", 22.0)])
         self.fd.c15 = {"LUSDT": cands}
-        self.fd.px = {"LUSDT": round(sig["div_open"] * 1.001, 4)}
+        self.fd.px = {"LUSDT": sig["div_close"]}
         self.r.tick(end - 300 + 8)                                           # a 5m close that is not a 15m close
         self.assertEqual(self.ev("RSI1H_SIGNAL"), [])
         self.r.tick(end + 8)
@@ -424,7 +424,7 @@ class Runner(unittest.TestCase):
         cands, sig = find_signal("long", 900, 120, end)
         self.arm("long", [("LUSDT", 22.0)])
         self.fd.c15 = {"LUSDT": cands}
-        self.fd.px = {"LUSDT": round(sig["div_open"] * 1.001, 4)}
+        self.fd.px = {"LUSDT": sig["div_close"]}
         self.r.on_close({"side": "long", "symbol": "LUSDT"}, {"ts": end - 59 * 60})   # a long closed 59 min ago
         self.assertNotIn("LUSDT", self.r.st["cooldown"])                               # shorts' cooldown untouched
         self.r.tick(end + 8)
@@ -437,29 +437,30 @@ class Runner(unittest.TestCase):
         cands, sig = find_signal("long", 900, 120, end)
         self.arm("long", [("LUSDT", 22.0)])
         self.fd.c15 = {"LUSDT": cands}
-        self.fd.px = {"LUSDT": round(sig["div_open"] * 1.001, 4)}
+        self.fd.px = {"LUSDT": sig["div_close"]}
         self.r.st["cooldown_long"]["LUSDT"] = end - 61 * 60            # long closed 61 min ago: allowed
         self.r.st["cooldown"]["LUSDT"] = end - 60                       # a short closed 1 min ago: shorts only
         self.r.tick(end + 8)
         self.assertEqual(self.b.book("1H RSI LONG")["open_trade"]["symbol"], "LUSDT")
 
-    def test_no_candle_fetch_without_free_margin(self):
+    def test_candles_checked_while_the_book_is_full(self):
+        """28 Nov 2026: armed coins are checked even with a full book (the signal is logged, never entered late)."""
         self.arm("short", [("AUSDT", 75.0)])
         bal = self.b.book("1H RSI SHORT")["balance"]
         self.b.book("1H RSI SHORT")["open_trade"] = {"symbol": "XUSDT", "product_id": 9, "side": "short", "margin": bal}
         self.r.tick(T0 + 300 + 8)
-        self.assertEqual(self.fd.calls, [])
+        self.assertEqual(self.fd.calls, [("AUSDT", "5m")])
 
     def test_widened_stop_logged(self):
         end = T0 + 300
         for seed in range(5000):
             cands = walk(98, 300, seed, start=end, drift=0.0005)
             sig = R.div_trigger(cands, "short", 45)
-            if sig and (sig["stop_ref"] - sig["div_open"] * 0.999) / sig["div_open"] < 0.004:
+            if sig and (sig["stop_ref"] - sig["div_close"]) / sig["div_close"] < 0.004:
                 break
         self.arm("short", [("AUSDT", 75.0)])
         self.fd.c5 = {"AUSDT": cands}
-        self.fd.px = {"AUSDT": round(sig["div_open"] * 0.999, 4)}
+        self.fd.px = {"AUSDT": sig["div_close"]}
         self.r.tick(end + 8)
         w = self.ev("RSI1H_STOP_WIDENED")
         self.assertEqual(len(w), 1)
@@ -485,7 +486,7 @@ class Candidates(Runner):
         cands, sig = find_signal("short", 300, 45, end)
         self.arm("short", [("AUSDT", 75.0), ("BUSDT", 88.0)])
         self.fd.c5 = {"AUSDT": cands, "BUSDT": cands}
-        px = round(sig["div_open"] * 0.999, 4)
+        px = sig["div_close"]
         self.fd.px = {"AUSDT": px, "BUSDT": px}
         n_before = len(self.fd.calls)
         self.r.tick(end + 8)
@@ -514,7 +515,7 @@ class Candidates(Runner):
         self.r.st["cooldown"]["CUSDT"] = end - 600
         self.r.tick(end + 8)
         a, c = self.rows()
-        self.assertEqual((a["reason"], a["entry_check"]), ("entry check", f"{sig['div_open']:g} >= open {sig['div_open']:g}"))
+        self.assertEqual((a["reason"], a["entry_check"]), ("outside band", f"{sig['div_open']:g} >= open {sig['div_open']:g}"))
         self.assertEqual(c["reason"], "cooldown")
 
     def test_no_rows_while_book_busy(self):
@@ -532,7 +533,7 @@ class RankByVolume(Runner):
         self.arm("short", [("AUSDT", 75.0), ("BUSDT", 88.0)])                # B has the more extreme RSI
         self.r.prods["AUSDT"]["vol24h"], self.r.prods["BUSDT"]["vol24h"] = vols
         self.fd.c5 = {"AUSDT": cands, "BUSDT": cands}
-        px = round(sig["div_open"] * px_factor, 4)
+        px = sig["div_close"] if px_factor == 0.999 else round(sig["div_open"] * px_factor, 4)
         self.fd.px = {"AUSDT": px, "BUSDT": px}
         return end, sig
 
@@ -572,7 +573,7 @@ class RankByVolume(Runner):
         self.r.tick(end + 8)
         self.assertEqual(self.b.book("1H RSI SHORT")["open_trade"]["symbol"], "BUSDT")
         a, b = self.rows()
-        self.assertEqual((a["symbol"], a["reason"], b["symbol"], b["taken"]), ("AUSDT", "entry check", "BUSDT", "yes"))
+        self.assertEqual((a["symbol"], a["reason"], b["symbol"], b["taken"]), ("AUSDT", "outside band", "BUSDT", "yes"))
 
     def test_rank_signals_unknown_volume_last_ties_by_rsi(self):
         sigs = [{"symbol": "X", "rsi1h": 80, "vol24h": None}, {"symbol": "Y", "rsi1h": 75, "vol24h": 5e6},
@@ -596,7 +597,7 @@ class StartupUniverse(Runner):
         end = T0 + 300
         cands, sig = find_signal("short", 300, 45, end)
         self.fd.c5 = {"AUSDT": cands}
-        self.fd.px = {"AUSDT": round(sig["div_open"] * 0.999, 4)}
+        self.fd.px = {"AUSDT": sig["div_close"]}
         self.r.tick(end + 8)
         self.assertEqual(self.r.prods["AUSDT"]["vol24h"], 3_000_000)
         self.assertNotIn(("AUSDT", "1h"), self.fd.calls)                     # no rescan, no 1h candles
@@ -620,7 +621,7 @@ class Execution(Runner):
         cands, sig = find_signal("short", 300, 45, end)
         self.arm("short", [("AUSDT", 80.0)])
         self.fd.c5 = {"AUSDT": cands}
-        px = round(sig["div_open"] * 0.999, 4)
+        px = sig["div_close"]
         self.fd.px = {"AUSDT": px}
         self.fd.books = {"AUSDT": (bids(px), [(px * 1.0001, 1e9)])}
         with mock.patch.object(self.bot_mod.time, "sleep", lambda s: None):
@@ -773,7 +774,7 @@ class ParallelTrades(Runner):
         cands, sig = find_signal("short", 300, 45, end)
         self.arm("short", [(s, 80.0 - i) for i, s in enumerate(syms)])
         self.fd.c5 = {s: cands for s in syms}
-        px = round(sig["div_open"] * 0.999, 4)
+        px = sig["div_close"]
         self.fd.px = {s: px for s in syms}
         return end, px
 
@@ -793,7 +794,7 @@ class ParallelTrades(Runner):
         taken = [r["symbol"] for r in rows if r["taken"] == "yes"]
         self.assertEqual(taken, [t["symbol"] for t in trades])
         skipped = [r for r in rows if r["taken"] == "no"]
-        self.assertEqual([r["reason"] for r in skipped], ["max open trades"])
+        self.assertEqual([r["reason"] for r in skipped], ["book full"])
         self.assertEqual(len(taken) + len(skipped), 4)
         self.assertAlmostEqual(self.b.free_margin("1H RSI SHORT"), bk["balance"] - used)
         st = self.b.status_text()
@@ -864,7 +865,8 @@ class LeftoverMargin(Runner):
         self.fd.depth_qty = 1e9
         self.r.tick(end + 8)
         self.assertEqual(len(self.b.book_trades("1H RSI SHORT")), 1)
-        self.assertEqual(self.fd.calls, [])            # no room: not even a candle call (as with no free margin)
+        self.assertEqual(self.fd.calls, [("AUSDT", "5m")])   # 28 Nov: still checked, the signal logged as skipped
+        self.assertIn("while the book was full", self.ev("RSI1H_SKIP")[-1]["reason"])
         avail, why = self.r.avail_margin("1H RSI SHORT")
         self.assertEqual((avail, why[1]), (0.0, "no leftover"))
         self.assertIn("not cut by the price-impact limit", why[0])
@@ -883,7 +885,7 @@ class LeftoverMargin(Runner):
         used = sum(t["margin"] for t in trades)
         self.assertAlmostEqual(bk["leftover"]["margin"], bk["balance"] - used, places=3)
         self.assertEqual(bk["leftover"]["after"], trades[-1]["symbol"])
-        self.assertEqual([r["reason"] for r in self.rows() if r["taken"] == "no"], ["max open trades"])
+        self.assertEqual([r["reason"] for r in self.rows() if r["taken"] == "no"], ["book full"])
         self.assertIn("leftover $", self.b.status_text())
 
     def test_leftover_below_25_pct_is_too_small(self):

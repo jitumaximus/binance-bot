@@ -297,7 +297,8 @@ class Live(unittest.TestCase):
         self.poll(bar + 20)
         self.assertEqual(len(self.b.book_trades("EMA20 LONG")), 1)
         self.assertEqual(self.ev("EMA20_SKIP"), [])                         # no room: not even tried...
-        self.assertIn(f"{self.SYM}|long", self.e.st["armed"])                # ...and still armed
+        self.assertNotIn(f"{self.SYM}|long", self.e.st["armed"])             # ...and cancelled (28 Nov: no late entry)
+        self.assertIn("while the book was full", self.ev("EMA20_CANCEL")[-1]["reason"])
         self.assertEqual(self.e.avail_margin_reason("long") if hasattr(self.e, "avail_margin_reason") else "no leftover",
                          "no leftover")
         bk["open_trade"] = None
@@ -307,7 +308,7 @@ class Live(unittest.TestCase):
         self.poll(bar + 26)
         self.assertEqual(self.ev("EMA20_SKIP")[-1]["reason"][:9], "too small")
 
-    def test_after_a_fill_the_other_breaches_stay_armed(self):
+    def test_after_a_fill_a_breach_in_the_full_book_is_cancelled(self):
         c, bar = self.arm()
         self.e.st["armed"]["QQUSDT|long"] = dict(self.e.arm_record("QQUSDT", "long", {
             "trigger": 1.0, "low": 0.9, "pb": 0.95, "r": 0.05, "ema": 0.97, "alert_time": 5, "pull": [6, 7],
@@ -315,7 +316,9 @@ class Live(unittest.TestCase):
         self.fd.px.update({self.SYM: 99.75, "QQUSDT": 1.1})
         self.poll(bar + 23)
         self.assertEqual(self.b.book("EMA20 LONG")["open_trade"]["symbol"], self.SYM)   # higher volume first
-        self.assertIn("QQUSDT|long", self.e.st["armed"])                                  # not consumed
+        # 28 Nov 2026: the book is full after that fill, so QQ's breach cancels it (never entered later)
+        self.assertNotIn("QQUSDT|long", self.e.st["armed"])
+        self.assertIn("while the book was full", self.ev("EMA20_CANCEL")[-1]["reason"])
         self.assertEqual(self.ev("EMA20_SKIP"), [])
 
     def test_short_setups_trade_in_the_short_book(self):

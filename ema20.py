@@ -12,10 +12,15 @@ CANDLES   after each 5m close (+EMA20_CHECK_DELAY_SEC, 8 s): 5m klines (99, requ
           to the setup state at the last closed candle in the worker; nothing big is kept.
 SETUP     alert -> 2 pullback candles -> armed with a trigger (EMA20_ALERT, EMA20_ARMED, EMA20_CANCEL events).
           Sides: EMA20_SIDES = both | long | short. Armed setups are watched on the live price: one call for all
-          symbols (/fapi/v1/ticker/price, weight 2) every EMA20_POLL_SEC (3 s), only while something is armed and
-          the book has room for a trade. EMA20_ALERT is one event per 5m close listing that candle's alerts (the
+          symbols (/fapi/v1/ticker/price, weight 2) every EMA20_POLL_SEC (3 s) while something is armed, also while
+          the book is full or the bot is paused (28 Nov 2026: then the trigger trading cancels the setup, "level
+          traded while the book was full: no late entry"). EMA20_ALERT is one event per 5m close listing that candle's alerts (the
           dry run on 27 Nov 2026 found ~22k alerts / ~6k armed setups a day across ~500 coins).
-ENTRY     price beyond the trigger -> capped IOC limit entry through the bot's executor, exactly as the 1H RSI books:
+ENTRY     (28 Nov 2026) only within ENTRY_LEVEL_CAP_PCT (0.1%) of the trigger, measured from the trigger, never from
+          the live price: long trigger <= price <= trigger x 1.001, short trigger x 0.999 <= price <= trigger (last
+          price and best ask / bid; the IOC limit is the band edge). Further: EMA20_CANCEL "price past the cap: no
+          late entry". Every cancel is a candidates.csv row (taken=no, reason, level, LTP, distance %).
+          price in the band -> capped IOC limit entry through the bot's executor, exactly as the 1H RSI books:
           20x isolated, size = min(free margin x 20, the 0.05% price-impact limit), max MAX_OPEN_TRADES (3) per book,
           extra trades only for the leftover of an impact-capped entry, margin >= MIN_TRADE_MARGIN_PCT (25%) of the
           book, liquidation beyond the stop, a coin held by one book at most. Several breaches at one check: highest
@@ -156,9 +161,9 @@ class Ema20:
                 res = None
             if res is not None:
                 self.on_close(now, bar_j, res)
-        if (self.ready and self.st["armed"] and now - self.last_poll >= self.c["poll_sec"]
-                and not self.b.state.get("paused")
-                and any(self.has_room(sd) for sd in {a["side"] for a in self.st["armed"].values()})):
+        # every armed setup is watched, also while its book is full or the bot is paused (28 Nov 2026): the
+        # trigger trading then cancels the setup (no late entry)
+        if self.ready and self.st["armed"] and now - self.last_poll >= self.c["poll_sec"]:
             self.last_poll = now
             try:
                 self.poll(now)
@@ -166,7 +171,7 @@ class Ema20:
                 log.exception("EMA20 price poll failed")
 
     def has_room(self, side):
-        """Prices are only watched while a side's book could take a trade (as the 1H RSI books skip their checks)."""
+        """Could the side's book take a trade now (fewer than MAX_OPEN_TRADES and margin for one)?"""
         book = book_of(side)
         return (len(self.b.book_trades(book)) < self.c["max_open"]
                 and R.avail_margin(self.b, book, self.c["min_trade_margin"])[1] is None)
@@ -284,12 +289,16 @@ class Ema20:
                 "expires": s["armed_time"] + self.c["max_wait"] * P5M,
                 "vol24h": (self.prods().get(sym) or {}).get("vol24h")}
 
-    def cancel(self, key, why):
+    def cancel(self, key, why, ltp=None, now=None):
+        """Drop an armed setup: EMA20_CANCEL event and a candidates.csv row (taken=no, level, LTP, distance)."""
         a = self.st["armed"].pop(key, None)
         if a:
             self.st["used"][key] = a["alert_time"]
             self.b.event("EMA20_CANCEL", book=book_of(a["side"]), side=a["side"], symbol=a["symbol"], reason=why,
-                         trigger=a["trigger"], alert=ist(a["alert_time"]))
+                         trigger=a["trigger"], alert=ist(a["alert_time"]),
+                         **({"price": ltp, "distance_pct": round(R.dist_pct(ltp, a["trigger"]), 4)} if ltp else {}))
+            self.candidate({"side": a["side"], "symbol": a["symbol"], "setup": a, "cand": {"ltp": ltp},
+                            "skip_reason": why}, "", now or time.time(), check="cancel")
 
     # ---- live price watch on armed setups ----
     def poll(self, now):
@@ -303,9 +312,17 @@ class Ema20:
             return
         hits.sort(key=lambda h: -(h[0].get("vol24h") or 0))          # highest 24h volume first
         for rank, (a, p) in enumerate(hits, 1):
-            if not self.has_room(a["side"]):
-                continue                # that side's book is full: the setup stays armed (cancelled at the close)
             key = f"{a['symbol']}|{a['side']}"
+            band = R.entry_band(a["side"], a["trigger"], self.c["level_cap"])
+            if self.b.state.get("paused"):
+                self.cancel(key, R.LATE_PAUSED, p, now)
+                continue
+            if not self.has_room(a["side"]):
+                self.cancel(key, R.LATE_FULL, p, now)       # the book is full: never entered later
+                continue
+            if not R.in_band(p, band):
+                self.cancel(key, R.late_cap(p, a["trigger"], band), p, now)
+                continue
             self.st["armed"].pop(key, None)
             self.st["used"][key] = a["alert_time"]                       # a setup is used once
             sig = {"side": a["side"], "symbol": a["symbol"], "setup": a, "ltp": p, "cand": {"ltp": p}}
@@ -350,6 +367,14 @@ class Ema20:
         if not lv:
             return self.skip(sig, "empty order book", "no order book")
         entry, tick, lev = lv[0][0], p["tick"], c["leverage"]
+        band = R.entry_band(side, a["trigger"], c["level_cap"])
+        cand.update(level=a["trigger"])
+        if not R.in_band(entry, band):
+            past = entry > band[1] if side == "long" else entry < band[0]
+            return self.skip(sig, (R.late_cap(entry, a["trigger"], band) if past else
+                                   f"best {'ask' if side == 'long' else 'bid'} not through the trigger yet "
+                                   f"({R.band_text(entry, a['trigger'], band)})") + " [order book]",
+                             "past the cap" if past else "outside band")
         hard = R.hard_stop_for(side, entry, tick, c["hard_stop"])
         liq = R.liq_price(side, entry, lev, c["mmr"])
         liq_pct = abs(liq - entry) / entry
@@ -373,7 +398,8 @@ class Ema20:
         cand["size"] = n * p["cv"]
         tx = {"side": side, "symbol": sym, "product_id": p["id"], "contracts": n, "cv": p["cv"], "tick": tick}
         why = b.capped_entry(tx, p["min_notional"], ob, impact_qty=impact,
-                             impact_capped=info["binding"] == "price impact", sweep=R.walk_price(lv, n * p["cv"]))
+                             impact_capped=info["binding"] == "price impact", sweep=R.walk_price(lv, n * p["cv"]),
+                             cap=R.band_cap(side, band, tick))        # never beyond trigger +/- 0.1%
         cand["exec"] = tx.get("exec")
         if why:
             return self.skip(sig, f"{why} (capped IOC entry)", why)
@@ -461,12 +487,12 @@ class Ema20:
             self.b.close_trade(t, {"reason": reason, "price": px, "ts": int(now), "estimated": True})
 
     # ---- candidates.csv ----
-    def candidate(self, sig, rank, now):
+    def candidate(self, sig, rank, now, check="price beyond trigger"):
         try:
             a, c = sig["setup"], sig.get("cand") or {}
             row = {"time": datetime.fromtimestamp(now, IST).strftime("%Y-%m-%d %H:%M:%S"), "bot": "binance-bot",
                    "book": book_of(sig["side"]), "symbol": sig["symbol"], "side": sig["side"].upper(),
-                   "check": "price beyond trigger",
+                   "check": check,
                    "taken": "yes" if sig.get("taken") else "no",
                    "reason": "" if sig.get("taken") else sig.get("skip_reason", ""), "rank": rank,
                    "ltp": c.get("ltp"), "level": a["trigger"],

@@ -17,9 +17,15 @@ SHORT     5m candles, checked ~8 s after each 5m close. First peak = RED candle 
 LONG      15m candles, ~8 s after each 15m close, RSI1H_LONG_WINDOW_MIN (120). First bottom = GREEN candle with
           high < EMA5 (the lowest such); divergence = the candle just closed: green, lower low, RSI(14, 15m) at least
           3 points higher, at least 2 candles between them.
-ENTRY     market at the start of the next candle (the check ~8 s after the close), only if the last trade price is
-          still below the red divergence candle's open (short) / above the green one's open (long); else skipped
-          and logged. Paper fill = last trade price, RSI1H_SLIPPAGE_PCT against us (0 = like the POC paper fills),
+ENTRY     market at the start of the next candle (the check ~8 s after the close), only within ENTRY_LEVEL_CAP_PCT
+          (0.1%) of the divergence candle's CLOSE: long close <= price <= close x 1.001, short close x 0.999 <= price
+          <= close (last trade price and best ask / bid; the IOC entry's limit is that band edge). Outside it:
+          RSI1H_SKIP "price past the cap: no late entry" (28 Nov 2026). Armed coins are checked even while the book
+          is full or the bot is paused: such a signal is skipped ("level traded while the book was full: no late
+          entry") and never entered later. Also skipped (28 Nov 2026): latest closed 1H RSI < RSI1H_EXTREME_LONG (10)
+          for a long ("falling knife") / > RSI1H_EXTREME_SHORT (90) for a short ("runaway pump"); entry more than
+          RSI1H_MAX_FROM_EXTREME_PCT (1%) above the divergence candle's low (long) / below its high (short). Every
+          skip is a candidates.csv row (taken=no, reason, level, LTP, distance %). Paper fill = last trade price, RSI1H_SLIPPAGE_PCT against us (0 = like the POC paper fills),
           taker fee FEE_PCT_PER_SIDE on both sides (in bot.close_trade). Several coins at once: highest 24h quote
           volume first (RSI1H_RANK_BY=volume, default since 25 Nov 2026; =rsi: most extreme 1H RSI first); if one is
           skipped, the next is tried. Up to MAX_OPEN_TRADES (3) open trades per book (26 Nov 2026). The first trade
@@ -117,6 +123,13 @@ def load_cfg(env=None):
         # several divergences at one check: "volume" = highest 24h quote volume first (since 25 Nov 2026),
         # "rsi" = most extreme 1H RSI first (before)
         "rank_by": "rsi" if str(e.get("RSI1H_RANK_BY", "volume")).strip().lower() == "rsi" else "volume",
+        # no late entries (28 Nov 2026): every book enters only within this fraction of its level (1H RSI: the
+        # divergence candle's close, EMA20: the trigger; 4H RETRACE has RETRACE_ENTRY_CAP_PCT)
+        "level_cap": f("ENTRY_LEVEL_CAP_PCT", 0.001),
+        # 1H RSI skip rules (28 Nov 2026): latest closed 1H RSI too extreme; entry too far from the divergence low/high
+        "extreme_long": f("RSI1H_EXTREME_LONG", 10),
+        "extreme_short": f("RSI1H_EXTREME_SHORT", 90),
+        "max_from_extreme": f("RSI1H_MAX_FROM_EXTREME_PCT", 1) / 100.0,
     }
 
 
@@ -214,9 +227,46 @@ def div_trigger(cands, side, window_min, min_gap=2, min_diff=3.0, ema_len=5, rsi
                   f"-> bullish divergence")
         stop_ref = d["low"]
     key = "high" if side == "short" else "low"
-    return {"side": side, "stop_ref": stop_ref, "div_open": d["open"], "div_time": d["time"], "ref_time": p["time"],
+    return {"side": side, "stop_ref": stop_ref, "div_open": d["open"], "div_close": d["close"], "div_time": d["time"],
+            "ref_time": p["time"],
             "ref_price": p[key], "div_price": d[key],
             "rsi_ref": ra, "rsi_div": rb, "rsi_gap": rg, "rsi_gap_exact": diff, "between": between, "detail": detail}
+
+
+# ---------------- no late entries (28 Nov 2026), shared by all six books ----------------
+LATE_FULL = "level traded while the book was full: no late entry"
+LATE_PAUSED = "level traded while the bot was paused: no late entry"
+
+
+def entry_band(side, level, pct, both=False):
+    """The prices a book may enter at, measured from the strategy's level (never from the live price).
+    both=False (EMA20, 1H RSI): only through the level in the trade's direction, long [level, level x (1 + pct)],
+    short [level x (1 - pct), level]. both=True (4H RETRACE): level x (1 -/+ pct)."""
+    if both:
+        return level * (1 - pct), level * (1 + pct)
+    return (level, level * (1 + pct)) if side == "long" else (level * (1 - pct), level)
+
+
+def in_band(price, band):
+    return band[0] * (1 - 1e-12) <= price <= band[1] * (1 + 1e-12)
+
+
+def dist_pct(price, level):
+    return (price / level - 1) * 100 if price and level else None
+
+
+def band_text(price, level, band):
+    return (f"price {price:g} is {dist_pct(price, level):+.3f}% from the level {level:g} "
+            f"(entry band {band[0]:.6g} - {band[1]:.6g})")
+
+
+def late_cap(price, level, band):
+    return f"price past the cap: no late entry ({band_text(price, level, band)})"
+
+
+def band_cap(side, band, tick):
+    """The IOC limit for an entry inside the band: its far edge (long: the top, short: the bottom), on the tick."""
+    return round_tick(band[1], tick, "down") if side == "long" else round_tick(band[0], tick, "up")
 
 
 def rank_signals(sigs, side, rank_by):
@@ -488,11 +538,12 @@ class Rsi1h:
                 log.exception("1H RSI universe load failed")
             if not self.prods:
                 self.next_scan_try = now + 60
-        paused = self.b.state.get("paused")
         for side, per, book in (("short", P5M, SHORT_BOOK), ("long", P15M, LONG_BOOK)):
             bnd = int(now) // per * per
             armed = self.st["armed_" + side]
-            if (armed and not paused and self.has_room(book) and bnd + self.c["check_delay"] <= now <= bnd + 60
+            # checked even while the book is full or the bot is paused (28 Nov 2026): such a signal is logged
+            # as skipped (no late entry), never entered later
+            if (armed and bnd + self.c["check_delay"] <= now <= bnd + 60
                     and now - self.last_try[side] >= 3):
                 if self.done[side][0] != bnd:
                     self.done[side] = (bnd, set())
@@ -625,7 +676,9 @@ class Rsi1h:
                    "stop_candle": c.get("stop_candle"), "stop_used": c.get("stop_used"),
                    "stop_pct": round(c["stop_pct"], 3) if c.get("stop_pct") is not None else None,
                    "size": c.get("size"), "vol24h_usdt": round(sig["vol24h"]) if sig.get("vol24h") else None,
-                   "rank_by": rank_by}
+                   "rank_by": rank_by, "level": c.get("level", sig.get("div_close")),
+                   "distance_pct": round(dist_pct(px, c.get("level", sig.get("div_close"))), 4)
+                   if px and sig.get("div_close") else None}
             x = c.get("exec") or {}
             row.update({k: x.get(k) for k in ("depth5_qty", "liq_cap_qty", "liq_capped", "entry_ref", "entry_cap",
                                               "entry_avg", "entry_slip_pct", "entry_children", "qty_intended",
@@ -659,14 +712,31 @@ class Rsi1h:
         book = SHORT_BOOK if side == "short" else LONG_BOOK
         p = self.prods.get(sym)
         cand = sig.setdefault("cand", {})          # numbers for candidates.csv
+        level = sig.get("div_close")
+        cand.update(level=level)
+        if b.state.get("paused") or len(b.book_trades(book)) >= c["max_open"] or self.avail_margin(book)[1]:
+            try:                                    # the price for the log (candidates.csv: LTP and distance)
+                cand["ltp"] = self.last_trade_price(sym) or None
+            except Exception:  # noqa: BLE001
+                pass
         if b.state.get("paused"):
-            return self.skip(sig, book, "bot is paused", "paused")
-        if len(b.book_trades(book)) >= c["max_open"]:
-            return self.skip(sig, book, f"{book} already has {len(b.book_trades(book))} trades open "
-                                        f"(MAX_OPEN_TRADES {c['max_open']})", "max open trades")
+            return self.skip(sig, book, LATE_PAUSED, "paused")
+        n_open = len(b.book_trades(book))
+        if n_open >= c["max_open"]:
+            return self.skip(sig, book, f"{LATE_FULL} ({book} already has {n_open} trades open, MAX_OPEN_TRADES "
+                                        f"{c['max_open']})", "book full")
         avail, why = self.avail_margin(book)
         if why:
+            if n_open:
+                return self.skip(sig, book, f"{LATE_FULL} ({why[0]})", "book full")
             return self.skip(sig, book, why[0], why[1])
+        r1h = sig.get("rsi1h")
+        if r1h is not None and side == "long" and r1h < c["extreme_long"]:
+            return self.skip(sig, book, f"1H RSI too extreme: falling knife (latest closed 1H RSI {r1h:g} < "
+                                        f"{c['extreme_long']:g})", "1H RSI too extreme")
+        if r1h is not None and side == "short" and r1h > c["extreme_short"]:
+            return self.skip(sig, book, f"1H RSI too extreme: runaway pump (latest closed 1H RSI {r1h:g} > "
+                                        f"{c['extreme_short']:g})", "1H RSI too extreme")
         if p is None:
             return self.skip(sig, book, "not in the universe any more", "not in universe")
         held = [n for n, t in b.open_trades() if t["product_id"] == p["id"]]
@@ -685,6 +755,12 @@ class Rsi1h:
         if px <= 0:
             return self.skip(sig, book, "no price")
         cand["ltp"] = px
+        band = entry_band(side, level, c["level_cap"]) if level else None
+        if band and not in_band(px, band):
+            past = px > band[1] if side == "long" else px < band[0]
+            return self.skip(sig, book, late_cap(px, level, band) if past else
+                             f"price not at the divergence candle's close yet ({band_text(px, level, band)})",
+                             "past the cap" if past else "outside band")
         if side == "short" and not px < sig["div_open"]:
             return self.skip(sig, book, f"price {px:g} not below the red divergence candle's open {sig['div_open']:g}",
                              "entry check")
@@ -700,6 +776,18 @@ class Rsi1h:
         if not lv:
             return self.skip(sig, book, "empty order book", "no order book")
         entry, tick, lev = lv[0][0], p["tick"], c["leverage"]
+        if band and not in_band(entry, band):
+            past = entry > band[1] if side == "long" else entry < band[0]
+            return self.skip(sig, book, (late_cap(entry, level, band) if past else
+                                         f"best {'ask' if side == 'long' else 'bid'} not at the level ({band_text(entry, level, band)})")
+                             + " [order book]", "past the cap" if past else "outside band")
+        ext = sig["stop_ref"]                       # the divergence candle's low (long) / high (short)
+        far = (entry / ext - 1) if side == "long" else (1 - entry / ext)
+        if ext > 0 and far > c["max_from_extreme"] + 1e-12:
+            return self.skip(sig, book, f"entry too far from the divergence {'low' if side == 'long' else 'high'}: "
+                                        f"{entry:g} is {far * 100:.2f}% {'above' if side == 'long' else 'below'} {ext:g} "
+                                        f"(max {c['max_from_extreme'] * 100:g}%)",
+                             "too far from the divergence " + ("low" if side == "long" else "high"))
         buf = b.cfg.get("stop_buffer_ticks", 1)
         stop, candle_stop, widened = stop_for(side, sig["stop_ref"], entry, tick, buf, c["min_stop_pct"])
         cand.update(stop_candle=candle_stop, stop_used=stop, stop_pct=abs(entry - stop) / entry * 100)
@@ -731,7 +819,8 @@ class Rsi1h:
         cand["size"] = n * p["cv"]
         tx = {"side": side, "symbol": sym, "product_id": p["id"], "contracts": n, "cv": p["cv"], "tick": tick}
         why = b.capped_entry(tx, p["min_notional"], ob, impact_qty=impact,
-                             impact_capped=info["binding"] == "price impact", sweep=walk_price(lv, n * p["cv"]))
+                             impact_capped=info["binding"] == "price impact", sweep=walk_price(lv, n * p["cv"]),
+                             cap=band_cap(side, band, tick) if band else None)
         cand["exec"] = tx.get("exec")
         if why:
             return self.skip(sig, book, f"{why} (capped IOC entry)", why)
