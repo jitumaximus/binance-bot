@@ -18,9 +18,10 @@ LONG      15m candles, ~8 s after each 15m close, RSI1H_LONG_WINDOW_MIN (120). F
           high < EMA5 (the lowest such); divergence = the candle just closed: green, lower low, RSI(14, 15m) at least
           3 points higher, at least 2 candles between them.
 ENTRY     market at the start of the next candle (the check ~8 s after the close), only within ENTRY_LEVEL_CAP_PCT
-          (0.1%) of the divergence candle's CLOSE: long close <= price <= close x 1.001, short close x 0.999 <= price
-          <= close (last trade price and best ask / bid; the IOC entry's limit is that band edge). Outside it:
-          RSI1H_SKIP "price past the cap: no late entry" (28 Nov 2026). Armed coins are checked even while the book
+          (0.1%) past the divergence candle's CLOSE: long price <= close x 1.001, short price >= close x 0.999 (last
+          trade price and best ask / bid; the IOC entry's limit is that edge). A better price (long below the close,
+          short above it) is allowed: the candle stop must then be within RSI1H_MAX_STOP_PCT (2%) of the entry. Past
+          the cap: RSI1H_SKIP "price past the cap: no late entry" (28 Nov 2026). Armed coins are checked even while the book
           is full or the bot is paused: such a signal is skipped ("level traded while the book was full: no late
           entry") and never entered later. Also skipped (28 Nov 2026): latest closed 1H RSI < RSI1H_EXTREME_LONG (10)
           for a long ("falling knife") / > RSI1H_EXTREME_SHORT (90) for a short ("runaway pump"); entry more than
@@ -38,7 +39,7 @@ ENTRY     market at the start of the next candle (the check ~8 s after the close
           a long on it closes.
 STOP      1 tick (STOP_BUFFER_TICKS) beyond the divergence candle's high (short) / low (long), at least
           RSI1H_MIN_STOP_PCT (0.5%) from entry (widened and logged if closer). Signals whose stop is more than
-          MAX_STOP_PCT (3%) from the entry are skipped ("stop too wide"). Every trade also has a hard stop HARD_STOP_PCT
+          RSI1H_MAX_STOP_PCT (2% since 28 Nov 2026, 3% before) from the entry are skipped ("stop too wide"). Every trade also has a hard stop HARD_STOP_PCT
           (1.5% since 28 Nov 2026, 3% before; shared by all six books) against the entry; the active stop is whichever is closer to the entry (paper: simulated; exit reason
           HARD_STOP when the hard stop was the active one). The books refuse to run live, so no exchange STOP_MARKET is
           placed yet: wire one in before any live switch.
@@ -100,7 +101,9 @@ def load_cfg(env=None):
         "max_impact": f("MAX_IMPACT_PCT", 0.0005),       # average fill within 0.05% of the best price
         "max_open": int(f("MAX_OPEN_TRADES", 3)),         # open trades per book
         "min_trade_margin": f("MIN_TRADE_MARGIN_PCT", 0.25),  # 27 Nov 2026: skip trades with margin < 25% of the book
-        "max_stop": f("MAX_STOP_PCT", 0.03),              # skip signals whose stop is further than 3%
+        # skip signals whose candle stop is further than this from the entry (RSI1H_MAX_STOP_PCT, percent; 2% since
+        # 28 Nov 2026, was MAX_STOP_PCT 3%: the 1.5% hard stop still caps the loss)
+        "max_stop": f("RSI1H_MAX_STOP_PCT", 2) / 100.0,
         "hard_stop": f("HARD_STOP_PCT", 0.015),           # protective stop 1.5% against the entry (3% until 28 Nov 2026)
         "mmr": f("RSI1H_MMR", 0.01),                      # maintenance margin rate for the liquidation price
         "book_depth": int(f("RSI1H_BOOK_DEPTH", 50)),     # order-book levels walked (50 = request weight 2)
@@ -756,11 +759,10 @@ class Rsi1h:
             return self.skip(sig, book, "no price")
         cand["ltp"] = px
         band = entry_band(side, level, c["level_cap"]) if level else None
-        if band and not in_band(px, band):
-            past = px > band[1] if side == "long" else px < band[0]
-            return self.skip(sig, book, late_cap(px, level, band) if past else
-                             f"price not at the divergence candle's close yet ({band_text(px, level, band)})",
-                             "past the cap" if past else "outside band")
+        # 28 Nov 2026: divergence books cap only the late side (long: at most 0.1% above the close, short: at most
+        # 0.1% below it); a better price is fine, limited by the candle stop (RSI1H_MAX_STOP_PCT, 2%)
+        if band and (px > band[1] if side == "long" else px < band[0]):
+            return self.skip(sig, book, late_cap(px, level, band), "past the cap")
         if side == "short" and not px < sig["div_open"]:
             return self.skip(sig, book, f"price {px:g} not below the red divergence candle's open {sig['div_open']:g}",
                              "entry check")
@@ -776,11 +778,8 @@ class Rsi1h:
         if not lv:
             return self.skip(sig, book, "empty order book", "no order book")
         entry, tick, lev = lv[0][0], p["tick"], c["leverage"]
-        if band and not in_band(entry, band):
-            past = entry > band[1] if side == "long" else entry < band[0]
-            return self.skip(sig, book, (late_cap(entry, level, band) if past else
-                                         f"best {'ask' if side == 'long' else 'bid'} not at the level ({band_text(entry, level, band)})")
-                             + " [order book]", "past the cap" if past else "outside band")
+        if band and (entry > band[1] if side == "long" else entry < band[0]):
+            return self.skip(sig, book, late_cap(entry, level, band) + " [order book]", "past the cap")
         ext = sig["stop_ref"]                       # the divergence candle's low (long) / high (short)
         far = (entry / ext - 1) if side == "long" else (1 - entry / ext)
         if ext > 0 and far > c["max_from_extreme"] + 1e-12:

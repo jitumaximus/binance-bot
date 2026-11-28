@@ -214,6 +214,32 @@ class Rsi1h(TR.Runner):
             self.assertEqual(self.b.book_trades(book), [])
             self.skipped(book, sig, "price past the cap: no late entry")
 
+    def go_px(self, side, px_of):
+        """Like go(), with the price set from the signal: px_of(sig) -> price."""
+        tf, win = (300, 45) if side == "short" else (900, 120)
+        end = T0 + tf
+        cands, sig = find_signal(side, tf, win, end)
+        self.arm(side, [("AUSDT", 75.0 if side == "short" else 25.0)])
+        (self.fd.c5 if side == "short" else self.fd.c15)["AUSDT"] = cands
+        self.fd.px = {"AUSDT": round(px_of(sig), 6)}
+        self.r.tick(end + 8)
+        return ("1H RSI SHORT" if side == "short" else "1H RSI LONG"), sig
+
+    def test_better_price_than_the_close_enters(self):
+        """28 Nov 2026 (TRUMP / MMT / CVC / ENSO were one tick on the better side of the close): a long below the
+        close / a short above it enters (still past the candle's open)."""
+        for side in ("long", "short"):
+            self.setUp()
+            book, sig = self.go_px(side, lambda g: (g["div_close"] + g["div_open"]) / 2)
+            self.assertEqual(self.b.book_trades(book)[0]["symbol"], "AUSDT", side)
+
+    def test_candle_stop_wider_than_2pct_skips(self):
+        self.r.c["max_from_extreme"] = 0.05             # let the 1% rule pass, to reach the 2% stop rule
+        book, sig = self.go("long", 0.0, far=2.5)
+        self.assertEqual(self.b.book_trades(book), [])
+        self.assertIn("(> 2%)", self.ev("RSI1H_SKIP")[-1]["reason"])
+        self.assertEqual(rows(self.d)[-1]["reason"], "stop too wide")
+
     def test_extreme_rsi(self):
         book, sig = self.go("long", 0.0, rsi=5.0)
         self.assertEqual(self.b.book_trades(book), [])

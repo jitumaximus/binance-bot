@@ -402,7 +402,7 @@ class Runner(unittest.TestCase):
         self.fd.c5 = {"AUSDT": cands}
         self.fd.px = {"AUSDT": sig["div_open"]}
         self.r.tick(end + 8)
-        self.assertIn("not at the divergence candle's close yet", self.ev("RSI1H_SKIP")[-1]["reason"])   # 28 Nov: band
+        self.assertIn("not below the red divergence candle's open", self.ev("RSI1H_SKIP")[-1]["reason"])
         self.assertIsNone(self.b.book("1H RSI SHORT")["open_trade"])
 
     def test_long_on_15m(self):
@@ -515,7 +515,7 @@ class Candidates(Runner):
         self.r.st["cooldown"]["CUSDT"] = end - 600
         self.r.tick(end + 8)
         a, c = self.rows()
-        self.assertEqual((a["reason"], a["entry_check"]), ("outside band", f"{sig['div_open']:g} >= open {sig['div_open']:g}"))
+        self.assertEqual((a["reason"], a["entry_check"]), ("entry check", f"{sig['div_open']:g} >= open {sig['div_open']:g}"))
         self.assertEqual(c["reason"], "cooldown")
 
     def test_no_rows_while_book_busy(self):
@@ -573,7 +573,7 @@ class RankByVolume(Runner):
         self.r.tick(end + 8)
         self.assertEqual(self.b.book("1H RSI SHORT")["open_trade"]["symbol"], "BUSDT")
         a, b = self.rows()
-        self.assertEqual((a["symbol"], a["reason"], b["symbol"], b["taken"]), ("AUSDT", "outside band", "BUSDT", "yes"))
+        self.assertEqual((a["symbol"], a["reason"], b["symbol"], b["taken"]), ("AUSDT", "entry check", "BUSDT", "yes"))
 
     def test_rank_signals_unknown_volume_last_ties_by_rsi(self):
         sigs = [{"symbol": "X", "rsi1h": 80, "vol24h": None}, {"symbol": "Y", "rsi1h": 75, "vol24h": 5e6},
